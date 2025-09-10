@@ -83,7 +83,7 @@ def cif_to_bcif_bytes(cif_path: str, rtol: float = 1e-6, atol: float = 1e-4) -> 
     bcif.write(buf)
     return buf.getvalue()
 
-# --------------- tiny container format (PACK) ---------------
+# --------------- small container format (PACK) ---------------
 MAGIC   = b"PACK"
 VERSION = 1
 
@@ -160,7 +160,7 @@ class DeltaAppender:
         for k in self.buf:
             self.buf[k].clear()
 
-# --------------- Metadata loader (stateful light validation) ---------------
+# --------------- Metadata loader ---------------
 class MetadataLoader:
     """Loads *_summary_confidences.json and *_confidences.json and normalizes shapes."""
     def load_light(self, dir_path: str, name: str, subdir: str) -> Dict[str, Any]:
@@ -168,7 +168,7 @@ class MetadataLoader:
         if not os.path.exists(path): return {}
         with open(path, "r") as f:
             data = json.load(f)
-        # light payload is expected to match CORE_SCHEMA keys (where applicable)
+        # light payload is expected to match CORE_SCHEMA keys
         return data
 
     def load_heavy(self, dir_path: str, name: str, subdir: str) -> Dict[str, Any]:
@@ -179,7 +179,7 @@ class MetadataLoader:
 
         return data
 
-# --------------- Scanner (pure-ish) ---------------
+# --------------- Scanner ---------------
 class WorkItem(TypedDict):
     run_name: str
     subdir: str
@@ -218,7 +218,7 @@ class RunScanner:
                 src_dir=os.path.join(input_dir, subdir),
             )
 
-# --------------- Config & pipeline (stateful orchestration) ---------------
+# --------------- Config & pipeline ---------------
 @dataclass
 class IngestConfig:
     out_path: str
@@ -244,20 +244,14 @@ class AF3IngestPipeline:
 
     def run(self, input_dirs: List[str]) -> None:
         for input_dir in input_dirs:
-            bcif_shard_path_for_run = self.bcif_packer.choose_shard()  # guarantees same shard per input_dir (like your original)
-            json_shard_path_for_run = self.json_packer.choose_shard()  # guarantees same shard per input_dir (like your original)
+            bcif_shard_path_for_run = self.bcif_packer.choose_shard()  # guarantees same shard per input_dir
+            json_shard_path_for_run = self.json_packer.choose_shard()  # guarantees same shard per input_dir
             if self.cfg.verbose:
                 print(f"[run] input_dir={input_dir} -> bcif_shard={os.path.basename(bcif_shard_path_for_run)}, json_shard={os.path.basename(json_shard_path_for_run)}")
 
             items_found = False
             for item in self.scanner.iter_items(input_dir):
                 items_found = True
-                # try:
-                #     bcif_bytes = cif_to_bcif_bytes(item["cif_path"], rtol=self.cfg.rtol, atol=self.cfg.atol)
-                # except Exception as ex:
-                #     if self.cfg.verbose:
-                #         print(f"ERROR: CIF encode failed for {item['cif_path']}: {ex}")
-                #     continue
                 bcif_bytes = cif_to_bcif_bytes(item["cif_path"], rtol=self.cfg.rtol, atol=self.cfg.atol)
 
                 # Append to shard
