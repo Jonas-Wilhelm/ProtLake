@@ -196,9 +196,17 @@ class RunScanner:
             if not e.is_dir():
                 continue
             subdir = e.name
-            cif_path = os.path.join(input_dir, subdir, f"{run_name}_{subdir}_model.cif")
+            cif_path        = os.path.join(input_dir, subdir, f"{run_name}_{subdir}_model.cif")
+            heavy_json_path = os.path.join(input_dir, subdir, f"{run_name}_{subdir}_confidences.json")
+            light_json_path = os.path.join(input_dir, subdir, f"{run_name}_{subdir}_summary_confidences.json")
             if not os.path.exists(cif_path):
-                # silent skip, caller may log
+                print(f"WARNING: Missing CIF file {cif_path}, skipping")
+                continue
+            if not os.path.exists(light_json_path):
+                print(f"WARNING: Missing light JSON file {light_json_path}, skipping")
+                continue
+            if not os.path.exists(heavy_json_path):
+                print(f"WARNING: Missing heavy JSON file {heavy_json_path}, skipping")
                 continue
             seed, sample = parse_seed_sample(subdir)
             yield WorkItem(
