@@ -113,6 +113,7 @@ class ShardPackWriter:
         self.max_bytes = max_bytes
         self.use_claims = use_claims
         self.claim_ttl = claim_ttl
+        self._current_shard: Optional[str] = None
 
         # only keep claim bookkeeping if user enabled claims
         if self.use_claims:
@@ -215,14 +216,38 @@ class ShardPackWriter:
     def choose_shard(self) -> str:
         """Return a shard path. If use_claims is True, claim it atomically.
         """
+        # Reuse current shard if still valid
+        if self._current_shard is not None:
+            shard = self._current_shard
+            claim_dir = self._claim_dir(shard)
+            # Non-claim mode: just check size
+            if not self.use_claims:
+                if not os.path.exists(shard) or os.path.getsize(shard) < self.max_bytes:
+                    return shard
+                else:
+                    self._current_shard = None
+            else:
+                # claim-mode: ensure we still own the claim and shard not full
+                if (os.path.exists(claim_dir) and claim_dir in self._owned_claims
+                    and (not os.path.exists(shard) or os.path.getsize(shard) < self.max_bytes)):
+                    return shard
+                # if claim was lost or shard is full -> drop current_shard and continue to pick a new one
+                self._current_shard = None
+        
+        # No current shard: find a new one
         if not self.use_claims:
             # pick first non-existent or non-full shard
             i = 0
             while True:
                 shard = os.path.join(self.shard_dir, f"{self.prefix}-{i:06d}.pack")
                 if not os.path.exists(shard):
+                    # don't set current_shard here until we actually create it in append,
+                    fd = os.open(shard, os.O_CREAT | os.O_RDWR, 0o644)
+                    os.close(fd)
+                    self._current_shard = shard
                     return shard
                 if os.path.getsize(shard) < self.max_bytes:
+                    self._current_shard = shard
                     return shard
                 i += 1
 
@@ -236,9 +261,11 @@ class ShardPackWriter:
             if os.path.exists(claim_dir):
                 if self._is_claim_stale(claim_dir):
                     if self._steal_stale_claim(claim_dir, shard):
+                        self._owned_claims.add(claim_dir)
                         # we now own the claim; ensure shard exists and return it
                         fd = os.open(shard, os.O_CREAT | os.O_RDWR, 0o644)
                         os.close(fd)
+                        self._current_shard = shard
                         return shard
                     else:
                         # failed to steal (race); skip to next
@@ -252,9 +279,11 @@ class ShardPackWriter:
             # No claim exists. If shard doesn't exist or is not full, try to create the claim
             if not os.path.exists(shard) or os.path.getsize(shard) < self.max_bytes:
                 if self._try_mkdir_claim(claim_dir):
+                    self._owned_claims.add(claim_dir)
                     # we own it; create/touch shard file
                     fd = os.open(shard, os.O_CREAT | os.O_RDWR, 0o644)
                     os.close(fd)
+                    self._current_shard = shard
                     return shard
                 else:
                     # lost race creating claim, try next
@@ -282,7 +311,7 @@ class ShardPackWriter:
         record = b"".join([hdr, rec_id, payload, crc])
 
         claim_dir = self._claim_dir(shard_path) if self.use_claims else None
-        if self.use_claims and os.path.exists(claim_dir) and claim_dir not in getattr(self, "_owned_claims", set()):
+        if self.use_claims and os.path.exists(claim_dir) and claim_dir not in self._owned_claims:
             # Defensive: another process owns it
             raise RuntimeError(f"Shard {shard_path} is claimed by another process ({claim_dir}).")
 
