@@ -1,4 +1,5 @@
-import os, io, json, time, hashlib, zlib, sys, fcntl, msgpack, zstandard as zstd
+import os, io, json, time, hashlib, zlib, sys, fcntl, msgpack, zstandard as zstd, atexit, shutil
+from socket import gethostname
 from dataclasses import dataclass
 from typing import Iterator, Optional, TypedDict, Dict, Any, List, Tuple
 import numpy as np
@@ -95,34 +96,195 @@ class PackRecord(TypedDict):
     shard_path: str
 
 class ShardPackWriter:
-    """Owns shard selection and appends PACK records. No Arrow/Delta logic here."""
-    def __init__(self, shard_dir: str, prefix: str = "bcif-pack", max_bytes: int = 1 << 30):
+    """Shard pack writer. Claim-based exclusive ownership across processes is optional.
+
+    Arguments:
+        shard_dir: directory to hold .pack files
+        prefix: shard filename prefix (e.g. "bcif-pack")
+        max_bytes: target max size per shard
+        use_claims: if True, use mkdir-based claim directories to avoid multiple processes
+                    writing to the same shard. 
+        claim_ttl: when using claims, consider a claim stale after this many seconds
+    """
+    def __init__(self, shard_dir: str, prefix: str = "bcif-pack", max_bytes: int = 1 << 30,
+                 use_claims: bool = False, claim_ttl: int = 300):
         self.shard_dir = shard_dir
         self.prefix = prefix
         self.max_bytes = max_bytes
+        self.use_claims = use_claims
+        self.claim_ttl = claim_ttl
 
+        # only keep claim bookkeeping if user enabled claims
+        if self.use_claims:
+            self._owned_claims: set[str] = set()
+            atexit.register(self._release_all_owned_claims)
+
+    # ---------- helpers for claim mode ----------
+    def _claim_dir(self, shard_path: str) -> str:
+        return f"{shard_path}.claim"
+
+    def _write_claim_meta(self, claim_dir: str) -> None:
+        if not self.use_claims:
+            return
+        meta = {
+            "hostname": gethostname(), 
+            "pid": os.getpid(), 
+            "ts": time.time(),
+            "slurm_job_id": os.environ.get("SLURM_JOB_ID", "N/A"),
+            "slurm_array_task_id": os.environ.get("SLURM_ARRAY_TASK_ID", "N/A"),
+        }
+        with open(os.path.join(claim_dir, "owner.json"), "w") as f:
+            json.dump(meta, f)
+
+    def _read_claim_meta(self, claim_dir: str) -> Optional[Dict[str, Any]]:
+        if not self.use_claims:
+            return None
+        try:
+            with open(os.path.join(claim_dir, "owner.json"), "r") as f:
+                return json.load(f)
+        except Exception:
+            return None
+
+    def _is_claim_stale(self, claim_dir: str) -> bool:
+        if not self.use_claims:
+            return False
+        try:
+            mtime = os.path.getmtime(claim_dir)
+        except FileNotFoundError:
+            return True
+        return (time.time() - mtime) > self.claim_ttl
+
+    def _try_mkdir_claim(self, claim_dir: str) -> bool:
+        if not self.use_claims:
+            return False
+        try:
+            os.mkdir(claim_dir)
+        except FileExistsError:
+            return False
+        # created -> write metadata
+        try:
+            self._write_claim_meta(claim_dir)
+        except Exception:
+            pass
+        self._owned_claims.add(claim_dir)
+        return True
+
+    def _steal_stale_claim(self, claim_dir: str, shard_path: str) -> bool:
+        if not self.use_claims:
+            return False
+        if not os.path.exists(claim_dir):
+            return False
+        if not self._is_claim_stale(claim_dir):
+            return False
+        try:
+            shutil.rmtree(claim_dir)
+        except Exception:
+            return False
+        
+        # After removing the claim, check shard size: if it's full, don't steal
+        if os.path.exists(shard_path) and os.path.getsize(shard_path) >= self.max_bytes:
+            # Another process finished the shard while this claim was stale — don't steal
+            return False
+
+        return self._try_mkdir_claim(claim_dir)
+
+    def release_shard(self, shard_path: str) -> None:
+        """Remove our claim on shard_path. No-op when claims are disabled."""
+        if not self.use_claims:
+            return
+        claim_dir = self._claim_dir(shard_path)
+        if claim_dir not in self._owned_claims:
+            return
+        try:
+            shutil.rmtree(claim_dir)
+        except Exception:
+            pass
+        self._owned_claims.discard(claim_dir)
+
+    def _release_all_owned_claims(self) -> None:
+        if not self.use_claims:
+            return
+        for claim_dir in list(self._owned_claims):
+            try:
+                shutil.rmtree(claim_dir)
+            except Exception:
+                pass
+            self._owned_claims.discard(claim_dir)
+
+    # ---------- shard selection ----------
     def choose_shard(self) -> str:
+        """Return a shard path. If use_claims is True, claim it atomically.
+        """
+        if not self.use_claims:
+            # pick first non-existent or non-full shard
+            i = 0
+            while True:
+                shard = os.path.join(self.shard_dir, f"{self.prefix}-{i:06d}.pack")
+                if not os.path.exists(shard):
+                    return shard
+                if os.path.getsize(shard) < self.max_bytes:
+                    return shard
+                i += 1
+
+        # claim-mode behaviour
         i = 0
         while True:
             shard = os.path.join(self.shard_dir, f"{self.prefix}-{i:06d}.pack")
-            if not os.path.exists(shard):
-                return shard
-            if os.path.getsize(shard) < self.max_bytes:
-                return shard
+            claim_dir = self._claim_dir(shard)
+
+            # If a claim exists, consider stealing if stale
+            if os.path.exists(claim_dir):
+                if self._is_claim_stale(claim_dir):
+                    if self._steal_stale_claim(claim_dir, shard):
+                        # we now own the claim; ensure shard exists and return it
+                        fd = os.open(shard, os.O_CREAT | os.O_RDWR, 0o644)
+                        os.close(fd)
+                        return shard
+                    else:
+                        # failed to steal (race); skip to next
+                        i += 1
+                        continue
+                else:
+                    # someone else owns an active claim; skip
+                    i += 1
+                    continue
+
+            # No claim exists. If shard doesn't exist or is not full, try to create the claim
+            if not os.path.exists(shard) or os.path.getsize(shard) < self.max_bytes:
+                if self._try_mkdir_claim(claim_dir):
+                    # we own it; create/touch shard file
+                    fd = os.open(shard, os.O_CREAT | os.O_RDWR, 0o644)
+                    os.close(fd)
+                    return shard
+                else:
+                    # lost race creating claim, try next
+                    i += 1
+                    continue
+
+            # shard exists and is full -> next
             i += 1
 
+    # ---------- append ----------
     def append(self, shard_path: str, payload: bytes, rec_id: Optional[bytes] = None) -> PackRecord:
+        """Append a PACK record. If use_claims=True, we verify ownership and release the
+           claim when the shard fills. Otherwise behaves the same as before.
+        """
         if rec_id is None:
             rec_id = hashlib.sha256(payload).digest()
         id_hex = rec_id.hex()
 
-        id_len   = len(rec_id)
+        id_len = len(rec_id)
         data_len = len(payload)
         hdr = (MAGIC + bytes([VERSION]) +
                id_len.to_bytes(2, "big") +
                data_len.to_bytes(4, "big"))
         crc = (zlib.crc32(payload) & 0xFFFFFFFF).to_bytes(4, "big")
         record = b"".join([hdr, rec_id, payload, crc])
+
+        claim_dir = self._claim_dir(shard_path) if self.use_claims else None
+        if self.use_claims and os.path.exists(claim_dir) and claim_dir not in getattr(self, "_owned_claims", set()):
+            # Defensive: another process owns it
+            raise RuntimeError(f"Shard {shard_path} is claimed by another process ({claim_dir}).")
 
         fd = os.open(shard_path, os.O_CREAT | os.O_RDWR, 0o644)
         try:
@@ -133,6 +295,15 @@ class ShardPackWriter:
         finally:
             fcntl.flock(fd, fcntl.LOCK_UN)
             os.close(fd)
+
+        # If this write made the shard reach or exceed max_bytes, release the claim (if used)
+        if self.use_claims:
+            try:
+                if os.path.getsize(shard_path) >= self.max_bytes:
+                    if claim_dir in self._owned_claims:
+                        self.release_shard(shard_path)
+            except Exception:
+                pass
 
         return {"id_hex": id_hex, "id_bytes": rec_id, "off": data_off, "length": data_len, "shard_path": os.path.basename(shard_path)}
 
@@ -229,6 +400,8 @@ class IngestConfig:
     atol: float = 1e-4
     bcif_shard_prefix: str = "bcif-pack"
     json_shard_prefix: str = "json-pack"
+    claim_mode: bool = False
+    claim_ttl: int = 300
 
 class AF3IngestPipeline:
     def __init__(self, cfg: IngestConfig):
@@ -236,8 +409,10 @@ class AF3IngestPipeline:
         self.shard_dir, self.delta_path = get_protlake_dirs(cfg.out_path)
         ensure_dirs([self.shard_dir, self.delta_path])
 
-        self.bcif_packer = ShardPackWriter(self.shard_dir, prefix=cfg.bcif_shard_prefix, max_bytes=cfg.shard_size)
-        self.json_packer = ShardPackWriter(self.shard_dir, prefix=cfg.json_shard_prefix, max_bytes=cfg.shard_size)
+        self.bcif_packer = ShardPackWriter(self.shard_dir, prefix=cfg.bcif_shard_prefix, max_bytes=cfg.shard_size,
+                                          use_claims=cfg.claim_mode, claim_ttl=cfg.claim_ttl)
+        self.json_packer = ShardPackWriter(self.shard_dir, prefix=cfg.json_shard_prefix, max_bytes=cfg.shard_size,
+                                          use_claims=cfg.claim_mode, claim_ttl=cfg.claim_ttl)
         self.delta_appender = DeltaAppender(self.delta_path, CORE_SCHEMA, batch_size=cfg.batch_size_metadata)
         self.loader = MetadataLoader()
         self.scanner = RunScanner()
