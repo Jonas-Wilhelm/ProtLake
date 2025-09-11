@@ -1,11 +1,15 @@
-import os, io, json, time, hashlib, zlib, sys, fcntl, msgpack, zstandard as zstd, atexit, shutil, uuid, random
-from socket import gethostname
-from dataclasses import dataclass
+import os, io, json, time, hashlib, zlib, fcntl, msgpack, atexit, shutil, uuid, random
 from typing import Iterator, Optional, TypedDict, Dict, Any, List, Tuple
+import zstandard as zstd
 import numpy as np
 import pyarrow as pa
+
+from socket import gethostname
+from dataclasses import dataclass
+
 from deltalake import write_deltalake
 from deltalake.exceptions import DeltaError
+
 from biotite.structure.io import load_structure
 from biotite.structure.io.pdbx import BinaryCIFFile, set_structure, compress
 

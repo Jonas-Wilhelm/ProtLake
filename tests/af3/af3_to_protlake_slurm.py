@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env -S PYTHONUNBUFFERED=1 python
 
 import os, time, sys
 from datetime import timedelta
@@ -32,7 +32,12 @@ print(f"Task {task_id} of {num_tasks} processing files {start} to {stop} (total 
 
 # --- perform the processing ---
 start_time = time.time()
-cfg = IngestConfig(out_path=out_path, batch_size_metadata=2000, shard_size=1 << 30, verbose=False)
+cfg = IngestConfig(
+    out_path=out_path, 
+    batch_size_metadata=1000, 
+    shard_size=1 << 28, 
+    verbose=False,
+    claim_mode=True)
 AF3IngestPipeline(cfg).run(af3_dirs)
 end_time = time.time()
 elapsed = round(time.time() - start_time)
