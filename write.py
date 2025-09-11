@@ -1,4 +1,4 @@
-import os, io, json, time, hashlib, zlib, fcntl, msgpack, atexit, shutil, uuid, random
+import os, io, json, time, hashlib, zlib, fcntl, msgpack, atexit, shutil, uuid, random, warnings
 from typing import Iterator, Optional, TypedDict, Dict, Any, List, Tuple
 import zstandard as zstd
 import numpy as np
@@ -532,6 +532,13 @@ class AF3IngestPipeline:
         self.delta_appender = DeltaAppender(self.delta_path, CORE_SCHEMA, batch_size=cfg.batch_size_metadata)
         self.loader = MetadataLoader()
         self.scanner = RunScanner()
+
+        warnings.filterwarnings(
+            "ignore", 
+            message="Attribute 'auth_.*_id' not found within 'atom_site' category", 
+            category=UserWarning, 
+            module="biotite.structure"
+        )
 
     def run(self, input_dirs: List[str]) -> None:
         for input_dir in input_dirs:
