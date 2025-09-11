@@ -1,10 +1,11 @@
-import os, io, json, time, hashlib, zlib, sys, fcntl, msgpack, zstandard as zstd, atexit, shutil, uuid
+import os, io, json, time, hashlib, zlib, sys, fcntl, msgpack, zstandard as zstd, atexit, shutil, uuid, random
 from socket import gethostname
 from dataclasses import dataclass
 from typing import Iterator, Optional, TypedDict, Dict, Any, List, Tuple
 import numpy as np
 import pyarrow as pa
 from deltalake import write_deltalake
+from deltalake.exceptions import DeltaError
 from biotite.structure.io import load_structure
 from biotite.structure.io.pdbx import BinaryCIFFile, set_structure, compress
 
@@ -247,24 +248,31 @@ class ShardPackWriter:
         """Return a shard path. If use_claims is True, claim it atomically using a lease token."""
         # Reuse current shard if still valid
         if self._current_shard is not None:
-            shard = self._current_shard
+            shard = os.path.realpath(self._current_shard)
             claim_dir = self._claim_dir(shard)
             # Non-claim mode: just check size
             if not self.use_claims:
                 if not os.path.exists(shard) or os.path.getsize(shard) < self.max_bytes:
-                    self._current_shard = os.path.realpath(shard)
-                    return self._current_shard
+                    self._current_shard = shard
+                    return shard
                 else:
                     self._current_shard = None
             else:
                 # Validate our lease is still the one on disk and shard isn't full
                 lease_id = self._owned_claims.get(claim_dir)
                 meta = self._read_claim_meta(claim_dir) if os.path.exists(claim_dir) else None
-                if (lease_id is not None and meta is not None and meta.get("lease_id") == lease_id
-                    and (not os.path.exists(shard) or os.path.getsize(shard) < self.max_bytes)):
-                    self._current_shard = os.path.realpath(shard)
-                    return self._current_shard
-                # Lost the lease or shard is full
+                if (lease_id is not None and meta is not None and meta.get("lease_id") == lease_id):
+                    # we still own the lease
+                    if (not os.path.exists(shard) or os.path.getsize(shard) < self.max_bytes):
+                        # shard is not full, keep using it
+                        self._current_shard = os.path.realpath(shard)
+                        return self._current_shard
+                    if os.path.getsize(shard) >= self.max_bytes:
+                        # shard is full, release claim
+                        self.release_shard(shard)
+                        self._current_shard = None
+                    # if the shard is full, release our claim
+                # Lost the lease
                 self._current_shard = None
 
         # No current shard: find a new one
@@ -272,22 +280,22 @@ class ShardPackWriter:
             # pick first non-existent or non-full shard
             i = 0
             while True:
-                shard = os.path.join(self.shard_dir, f"{self.prefix}-{i:06d}.pack")
+                shard = os.path.realpath(os.path.join(self.shard_dir, f"{self.prefix}-{i:06d}.pack"))
                 if not os.path.exists(shard):
                     # don't set current_shard here until we actually create it in append,
                     fd = os.open(shard, os.O_CREAT | os.O_RDWR, 0o644)
                     os.close(fd)
-                    self._current_shard = os.path.realpath(shard)
-                    return self._current_shard
+                    self._current_shard = shard
+                    return shard
                 if os.path.getsize(shard) < self.max_bytes:
-                    self._current_shard = os.path.realpath(shard)
-                    return self._current_shard
+                    self._current_shard = shard
+                    return shard
                 i += 1
 
         # claim-mode behaviour
         i = 0
         while True:
-            shard = os.path.join(self.shard_dir, f"{self.prefix}-{i:06d}.pack")
+            shard = os.path.realpath(os.path.join(self.shard_dir, f"{self.prefix}-{i:06d}.pack"))
             claim_dir = self._claim_dir(shard)
 
             # If a claim exists, consider stealing if stale
@@ -298,7 +306,7 @@ class ShardPackWriter:
                         fd = os.open(shard, os.O_CREAT | os.O_RDWR, 0o644)
                         os.close(fd)
                         self._current_shard = shard
-                        return self._current_shard
+                        return shard
                     else:
                         # failed to steal (race); skip to next
                         i += 1
@@ -314,7 +322,7 @@ class ShardPackWriter:
                     fd = os.open(shard, os.O_CREAT | os.O_RDWR, 0o644)
                     os.close(fd)
                     self._current_shard = shard
-                    return self._current_shard
+                    return shard
                 else:
                     # lost race creating claim, try next
                     i += 1
@@ -377,11 +385,18 @@ class ShardPackWriter:
 # --------------- Delta appenders ---------------
 class DeltaAppender:
     """Buffer rows per schema and flush to a Delta table via deltalake."""
-    def __init__(self, table_path: str, schema: pa.Schema, batch_size: int = 2500):
+    def __init__(self, table_path: str, schema: pa.Schema, batch_size: int = 2500,
+                 max_retries: int = 20, base_sleep: float = 0.05, max_sleep: float = 10.0, jitter: float = 0.1):
         self.table_uri = f"file://{os.path.abspath(table_path)}"
         self.schema = schema
         self.batch_size = batch_size
         self.buf: Dict[str, List[Any]] = {f.name: [] for f in schema}
+
+        # retry settings
+        self.max_retries = max_retries
+        self.base_sleep = base_sleep
+        self.max_sleep = max_sleep
+        self.jitter = jitter
 
     def add_row(self, row: Dict[str, Any]) -> None:
         # Strictly adhere to schema fields; missing fields become None
@@ -390,11 +405,41 @@ class DeltaAppender:
         if len(self.buf[self.schema[0].name]) >= self.batch_size:
             self.flush()
 
+    def _is_retryable_delta_error(self, e: Exception) -> bool:
+        # only retry known concurrency conflicts
+        msg = str(e).lower()
+        retryable_phrases = [
+            "version 0 already exists",
+        ]
+        return any(phrase in msg for phrase in retryable_phrases)
+
     def flush(self) -> None:
         if not self.buf[self.schema[0].name]:
             return
+        
         tbl = pa.Table.from_pydict(self.buf, schema=self.schema)
-        write_deltalake(self.table_uri, tbl, mode="append")
+
+        delay = self.base_sleep
+
+        for attempt in range(1, self.max_retries + 1):
+            try:
+                # mode="append" will create table if missing
+                write_deltalake(self.table_uri, tbl, mode="append")
+                break  # success
+            except DeltaError as e:
+                if attempt < self.max_retries and self._is_retryable_delta_error(e):
+                    # exponential backoff + jitter
+                    sleep_for = min(self.max_sleep, delay + random.random() * self.jitter)
+                    print(f"WARNING: write_deltalake failed with retryable error (attempt {attempt}/{self.max_retries}). Retrying in {sleep_for:.2f}s...")
+                    print(f"  error: {e}")
+                    time.sleep(sleep_for)
+                    delay = min(self.max_sleep, delay * 2.0)
+                    continue
+                # not retryable or out of retries
+                print(f"ERROR: write_deltalake failed permanently after {attempt} attempts.")
+                raise
+
+
         for k in self.buf:
             self.buf[k].clear()
 
