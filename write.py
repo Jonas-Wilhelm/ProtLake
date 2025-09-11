@@ -108,7 +108,7 @@ class ShardPackWriter:
     """
     def __init__(self, shard_dir: str, prefix: str = "bcif-pack", max_bytes: int = 1 << 30,
                  use_claims: bool = False, claim_ttl: int = 300):
-        self.shard_dir = shard_dir
+        self.shard_dir = os.path.realpath(shard_dir)
         self.prefix = prefix
         self.max_bytes = max_bytes
         self.use_claims = use_claims
@@ -180,7 +180,8 @@ class ShardPackWriter:
             except Exception:
                 pass
             return False
-        
+
+        # Track our lease string in-process
         self._owned_claims[claim_dir] = lease_id
         return True
 
@@ -191,6 +192,7 @@ class ShardPackWriter:
             return False
         if not self._is_claim_stale(claim_dir):
             return False
+        
         # If the shard is already full, don't steal
         if os.path.exists(shard_path) and os.path.getsize(shard_path) >= self.max_bytes:
             return False
@@ -200,7 +202,7 @@ class ShardPackWriter:
         except Exception:
             return False
 
-        # If we successfully removed the claim, try to create a new one
+        # Create a fresh claim (with a fresh lease_id)
         return self._try_mkdir_claim(claim_dir)
 
     def release_shard(self, shard_path: str) -> None:
@@ -211,9 +213,10 @@ class ShardPackWriter:
         lease_id = self._owned_claims.get(claim_dir)
         if lease_id is None:
             return
+
         meta = self._read_claim_meta(claim_dir)
-        if meta is None or meta.get("lease_id") != lease_id:
-            # lost the claim
+        # Only delete if we still hold the authoritative lease
+        if meta is not None and meta.get("lease_id") != lease_id:
             self._owned_claims.pop(claim_dir, None)
             return
         # still own it -> remove
@@ -221,7 +224,7 @@ class ShardPackWriter:
             shutil.rmtree(claim_dir)
         except Exception:
             pass
-        self._owned_claims.discard(claim_dir)
+        self._owned_claims.pop(claim_dir, None)
 
     def _release_all_owned_claims(self) -> None:
         if not self.use_claims:
@@ -229,15 +232,15 @@ class ShardPackWriter:
         # Only remove claims that still carry our lease_id
         for claim_dir, lease_id in list(self._owned_claims.items()):
             meta = self._read_claim_meta(claim_dir)
-            if meta is None or meta.get("lease_id") != lease_id:
-                # lost the claim, just drop from bookkeeping
+            if meta is not None and meta.get("lease_id") != lease_id:
+                # Lost ownership; don't tear down someone else's claim
                 self._owned_claims.pop(claim_dir, None)
                 continue
             try:
                 shutil.rmtree(claim_dir)
             except Exception:
                 pass
-            self._owned_claims.discard(claim_dir)
+            self._owned_claims.pop(claim_dir, None)
 
     # ---------- shard selection ----------
     def choose_shard(self) -> str:
@@ -249,7 +252,8 @@ class ShardPackWriter:
             # Non-claim mode: just check size
             if not self.use_claims:
                 if not os.path.exists(shard) or os.path.getsize(shard) < self.max_bytes:
-                    return shard
+                    self._current_shard = os.path.realpath(shard)
+                    return self._current_shard
                 else:
                     self._current_shard = None
             else:
@@ -258,7 +262,8 @@ class ShardPackWriter:
                 meta = self._read_claim_meta(claim_dir) if os.path.exists(claim_dir) else None
                 if (lease_id is not None and meta is not None and meta.get("lease_id") == lease_id
                     and (not os.path.exists(shard) or os.path.getsize(shard) < self.max_bytes)):
-                    return shard
+                    self._current_shard = os.path.realpath(shard)
+                    return self._current_shard
                 # Lost the lease or shard is full
                 self._current_shard = None
 
@@ -272,11 +277,11 @@ class ShardPackWriter:
                     # don't set current_shard here until we actually create it in append,
                     fd = os.open(shard, os.O_CREAT | os.O_RDWR, 0o644)
                     os.close(fd)
-                    self._current_shard = shard
-                    return shard
+                    self._current_shard = os.path.realpath(shard)
+                    return self._current_shard
                 if os.path.getsize(shard) < self.max_bytes:
-                    self._current_shard = shard
-                    return shard
+                    self._current_shard = os.path.realpath(shard)
+                    return self._current_shard
                 i += 1
 
         # claim-mode behaviour
@@ -293,7 +298,7 @@ class ShardPackWriter:
                         fd = os.open(shard, os.O_CREAT | os.O_RDWR, 0o644)
                         os.close(fd)
                         self._current_shard = shard
-                        return shard
+                        return self._current_shard
                     else:
                         # failed to steal (race); skip to next
                         i += 1
@@ -309,7 +314,7 @@ class ShardPackWriter:
                     fd = os.open(shard, os.O_CREAT | os.O_RDWR, 0o644)
                     os.close(fd)
                     self._current_shard = shard
-                    return shard
+                    return self._current_shard
                 else:
                     # lost race creating claim, try next
                     i += 1
@@ -320,9 +325,8 @@ class ShardPackWriter:
 
     # ---------- append ----------
     def append(self, shard_path: str, payload: bytes, rec_id: Optional[bytes] = None) -> PackRecord:
-        """Append a PACK record. If use_claims=True, we verify ownership and release the
-           claim when the shard fills. Otherwise behaves the same as before.
-        """
+        """Append a PACK record. With claims enabled, verify our lease matches on disk."""
+        shard_path = os.path.realpath(shard_path)
         if rec_id is None:
             rec_id = hashlib.sha256(payload).digest()
         id_hex = rec_id.hex()
@@ -335,10 +339,15 @@ class ShardPackWriter:
         crc = (zlib.crc32(payload) & 0xFFFFFFFF).to_bytes(4, "big")
         record = b"".join([hdr, rec_id, payload, crc])
 
+        # Authoritative lease validation
         claim_dir = self._claim_dir(shard_path) if self.use_claims else None
-        if self.use_claims and os.path.exists(claim_dir) and claim_dir not in self._owned_claims:
-            # Defensive: another process owns it
-            raise RuntimeError(f"Shard {shard_path} is claimed by another process ({claim_dir}).")
+        if self.use_claims:
+            lease_id = self._owned_claims.get(claim_dir or "")
+            meta = self._read_claim_meta(claim_dir) if (claim_dir and os.path.exists(claim_dir)) else None
+            if not (lease_id and meta and meta.get("lease_id") == lease_id):
+                raise RuntimeError(
+                    f"Shard {shard_path} is not leased by this process (lease mismatch or missing).\nmeta: {meta}\nlease_id: {lease_id}"
+                )
 
         fd = os.open(shard_path, os.O_CREAT | os.O_RDWR, 0o644)
         try:
@@ -350,20 +359,18 @@ class ShardPackWriter:
             fcntl.flock(fd, fcntl.LOCK_UN)
             os.close(fd)
 
-        # If this write made the shard reach or exceed max_bytes, release the claim (if used)
         if self.use_claims:
-            # heartbeat the claim
+            # heartbeat after successful write (keeps TTL fresh on dir mtime)
             try:
                 os.utime(claim_dir, None)  # heartbeat
             except Exception:
                 pass
-            # check size and release if full
-            try:
-                if os.path.getsize(shard_path) >= self.max_bytes:
-                    if claim_dir in self._owned_claims:
-                        self.release_shard(shard_path)
-            except Exception:
-                pass
+            # # Release claim if shard is full
+            # try:
+            #     if os.path.exists(shard_path) and os.path.getsize(shard_path) >= self.max_bytes:
+            #         self.release_shard(shard_path)
+            # except Exception:
+            #     pass
 
         return {"id_hex": id_hex, "id_bytes": rec_id, "off": data_off, "length": data_len, "shard_path": os.path.basename(shard_path)}
 
