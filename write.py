@@ -7,8 +7,10 @@ import pyarrow as pa
 from socket import gethostname
 from dataclasses import dataclass
 
-from deltalake import write_deltalake
+from deltalake import write_deltalake, DeltaTable
 from deltalake.exceptions import DeltaError
+
+import pyarrow.compute as pc
 
 from biotite.structure.io import load_structure
 from biotite.structure.io.pdbx import BinaryCIFFile, set_structure, compress
@@ -525,6 +527,7 @@ class IngestConfig:
     json_shard_prefix: str = "json-pack"
     claim_mode: bool = False
     claim_ttl: int = 60 * 30
+    dont_ingest_if_exists: bool = True
 
 class AF3IngestPipeline:
     def __init__(self, cfg: IngestConfig):
@@ -548,6 +551,22 @@ class AF3IngestPipeline:
         )
 
     def run(self, input_dirs: List[str]) -> None:
+        if self.cfg.dont_ingest_if_exists and os.path.exists(self.delta_path):
+            # Skip already ingested runs
+            dt = DeltaTable(f"file://{os.path.abspath(self.delta_path)}")
+            existing_tbl = dt.to_pyarrow_table(columns=["name"])
+            existing_names = set(existing_tbl.column("name").to_pylist())
+            non_existing_input_dirs = [d for d in input_dirs if os.path.basename(os.path.normpath(d)) not in existing_names]
+            if not non_existing_input_dirs:
+                print(f"All {len(input_dirs)} input runs already ingested! Exiting.")
+                return
+            else:
+                print(f"Skipping {len(input_dirs) - len(non_existing_input_dirs)} already ingested runs.")
+                if self.cfg.verbose:
+                    skipped = [os.path.basename(os.path.normpath(d)) for d in input_dirs if os.path.basename(os.path.normpath(d)) in existing_names]
+                    print(f"The following runs were skipped: {', '.join(skipped)}")
+                input_dirs = non_existing_input_dirs
+
         for input_dir in input_dirs:
             bcif_shard_path_for_run = self.bcif_packer.choose_shard()  # guarantees same shard per input_dir
             json_shard_path_for_run = self.json_packer.choose_shard()  # guarantees same shard per input_dir
