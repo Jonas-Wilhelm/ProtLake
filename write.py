@@ -554,7 +554,7 @@ class AF3IngestPipeline:
         )
 
     def run(self, input_dirs: List[str]) -> None:
-        if self.cfg.dont_ingest_if_exists and os.path.exists(self.delta_path):
+        if self.cfg.dont_ingest_if_exists and os.path.exists(os.path.join(self.delta_path, "_delta_log")):
             # Skip already ingested runs
             print("Checking for already ingested runs...")
             check_start = time.time()

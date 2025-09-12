@@ -16,12 +16,6 @@ def get_protlake_dirs(out_path):
     delta_path = os.path.join(out_path, "delta")
     return shard_dir, delta_path
 
-def get_protlake_dirs_old(out_path):
-    shard_dir = os.path.join(out_path, "shards")
-    delta_core_path = os.path.join(out_path, "delta", "meta_core")
-    delta_heavy_path = os.path.join(out_path, "delta", "meta_heavy")
-    return shard_dir, delta_core_path, delta_heavy_path
-
 def ensure_dirs(list_of_dirs):
     for path in list_of_dirs:
         os.makedirs(path, exist_ok=True)
