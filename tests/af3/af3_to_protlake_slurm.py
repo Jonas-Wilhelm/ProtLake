@@ -34,8 +34,8 @@ print(f"Task {task_id} of {num_tasks} processing files {start} to {stop} (total 
 start_time = time.time()
 cfg = IngestConfig(
     out_path=out_path, 
-    batch_size_metadata=1000, 
-    shard_size=1 << 28, 
+    batch_size_metadata=2000, 
+    shard_size=1 << 30, 
     verbose=False,
     claim_mode=True)
 AF3IngestPipeline(cfg).run(af3_dirs)

@@ -30,9 +30,11 @@ CORE_SCHEMA = pa.schema([
     pa.field("seed", pa.int32()),
     pa.field("bcif_shard", pa.string()),
     pa.field("bcif_off", pa.int64()),
+    pa.field("bcif_data_off", pa.int64()),
     pa.field("bcif_len", pa.int32()),
     pa.field("json_shard", pa.string()),
     pa.field("json_off", pa.int64()),
+    pa.field("json_data_off", pa.int64()),
     pa.field("json_len", pa.int32()),
     pa.field("chain_iptm", list_f32),
     pa.field("chain_pair_iptm", lol_f32),
@@ -54,7 +56,12 @@ class CoreRow(TypedDict, total=False):
     seed: int
     bcif_shard: str
     bcif_off: int
+    bcif_data_off: int
     bcif_len: int
+    json_shard: str
+    json_off: int
+    json_data_off: int
+    json_len: int
     chain_iptm: List[float]
     chain_pair_iptm: List[List[float]]
     chain_pair_pae_min: List[List[float]]
@@ -384,7 +391,7 @@ class ShardPackWriter:
             # except Exception:
             #     pass
 
-        return {"id_hex": id_hex, "id_bytes": rec_id, "off": data_off, "length": data_len, "shard_path": os.path.basename(shard_path)}
+        return {"id_hex": id_hex, "id_bytes": rec_id, "off": off, "data_off": data_off, "length": data_len, "shard_path": os.path.basename(shard_path)}
 
 # --------------- Delta appenders ---------------
 class DeltaAppender:
@@ -578,9 +585,11 @@ class AF3IngestPipeline:
                     seed=int(item["seed"]),
                     bcif_shard=bcif_pack["shard_path"],
                     bcif_off=int(bcif_pack["off"]),
+                    bcif_data_off=int(bcif_pack["data_off"]),
                     bcif_len=int(bcif_pack["length"]),
                     json_shard=json_pack["shard_path"],
                     json_off=int(json_pack["off"]),
+                    json_data_off=int(json_pack["data_off"]),
                     json_len=int(json_pack["length"]),
                 )
 
