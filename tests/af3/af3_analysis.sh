@@ -11,9 +11,12 @@ python -m  analyze.af3.analyze \
     --num-tasks 2 \
     --protlake-path "$protlake_dir" \
     --design-dir tests/af3/testdata_design_models \
+    --custom-scorefxn-dir analyze/af3/scorefxns \
+    --scorefxns lig_atom_dist lig_rmsd motif_rmsd \
     --atom_names_rmsd 'MY-AKN:TS1$C1:C2:C3:O1:C4:C5:C6:C7:C8:C9:C10 MY-AZD:TS1$N3:N4:N5:C16:C17:C18:C19:C20:C21:N6:N7' \
     --chem_eq_atoms 'MY-AKN:TS1$C5:C6_C7:C8' \
-    --custom-scorefxn-dir analyze/af3/scorefxns \
+    --motif-residues-contig 'A1-10' \
+    --superimpose-on-motif \
     --ligand_atom_distances MY-AKN:C1_MY-AZD:N3 MY-AKN:C2_MY-AZD:N5 \
     --log-dir tests_out/logs
 

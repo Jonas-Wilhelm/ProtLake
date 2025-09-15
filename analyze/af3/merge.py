@@ -2,7 +2,7 @@ import os, shutil
 from deltalake import DeltaTable
 from utils import deltatable_maintenance
 import argparse
-from utils import get_protlake_dirs
+from utils import get_protlake_dirs, DeltaTable_nrow
 
 def main():
     parser = argparse.ArgumentParser()
@@ -21,6 +21,9 @@ def main():
     dt = DeltaTable(f"file://{os.path.abspath(delta_path_main)}")
 
     dt_stage = DeltaTable(f"file://{os.path.abspath(staging_path)}")
+
+    if DeltaTable_nrow(dt) != DeltaTable_nrow(dt_stage):
+        print(f"Warning: main table has {DeltaTable_nrow(dt)} rows, but staging table has {DeltaTable_nrow(dt_stage)} rows.")
 
     dt.alter.add_columns(
         dt_stage.schema().fields

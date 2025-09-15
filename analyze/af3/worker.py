@@ -26,15 +26,18 @@ def _import_plugin_module(path: Path):
     spec.loader.exec_module(m)
     return m
 
-def load_scorefxns(plugin_dir, parser=None):
+def load_scorefxns(plugin_dir, parser=None, names=None):
     scorefxns = []
     for p in Path(plugin_dir).glob("*.py"):
         if p.name.startswith("_"): # for templates or deactivating 
             continue
+        if names is not None:
+            if p.stem not in names:
+                continue
         m = _import_plugin_module(p)
         if hasattr(m, "score") and callable(m.score):
             scorefxns.append({
-                "name": getattr(m, "scorer_name", m.__name__),
+                "name": getattr(m, "scorefxn_name", m.__name__),
                 "fn": m.score,
             })
             # add command line options to parser if plugin contains register_args
@@ -92,7 +95,7 @@ def eval_scorefxns(scorefxns, aa_design, aa_af3, meta, confidences, sc_close_to_
 
 def _sq_euclidian(reference, subject):
     '''
-    Hidden function from biotite
+    Squared Euclidian distance function from biotite
     '''
     reference_coord = coord(reference)
     subject_coord = coord(subject)
@@ -124,6 +127,11 @@ def _filter_atoms_close_to_hetero(aa, dist = 7.5):
     return (near_mask & ~aa.hetero)
 
 def rmsd_sc_automorphic(reference, subject):
+    """
+    Compute the per-residue all-atom RMSD between two structures, accounting for
+    symmetry in selected sidechain atoms (e.g., OD1/OD2 in ASP). Returns the overall 
+    RMSD across all residues.
+    """
     # TODO make this work with non complete residues (e.g. only last 3 atoms of PHE)
     SYMMETRY_MAP = {
         "ASP": [("OD1","OD2")],
@@ -150,6 +158,10 @@ def rmsd_sc_automorphic(reference, subject):
             atom_idx_swapped = atom_idx.copy()
             atom_pairs = SYMMETRY_MAP[res_name]
             for atom_pair in atom_pairs:
+                # check if both atoms in pair are present
+                if not (np.any(reference[atom_idx].atom_name == atom_pair[0]) and np.any(reference[atom_idx].atom_name == atom_pair[1])):
+                    continue
+                # swap their indices
                 idx_a = np.where(reference[atom_idx].atom_name == atom_pair[0])[0][0]
                 idx_b = np.where(reference[atom_idx].atom_name == atom_pair[1])[0][0]
                 atom_idx_swapped[idx_a], atom_idx_swapped[idx_b] = atom_idx_swapped[idx_b], atom_idx_swapped[idx_a]
@@ -186,11 +198,12 @@ def main():
     # bootstrap parser to parse custom score function directory
     bootstrap_parser = argparse.ArgumentParser()
     bootstrap_parser.add_argument("--custom-scorefxn-dir", default="analyze/af3/scorefxns", help="directory with scorer plugins")
+    bootstrap_parser.add_argument("--scorefxns", type=str, nargs="+", default=None, help="Names of score functions to run (default: all in --custom-scorefxn-dir)")
     boot_args, remaining_argv = bootstrap_parser.parse_known_args()
 
     # main parser and load score functions
     parser = argparse.ArgumentParser(description="Run analysis")
-    scorefxns = load_scorefxns(plugin_dir=Path(boot_args.custom_scorefxn_dir), parser=parser)
+    scorefxns = load_scorefxns(plugin_dir=Path(boot_args.custom_scorefxn_dir), parser=parser, names=boot_args.scorefxns)
     print("Loaded score functions:", [s["name"] for s in scorefxns])
     parser.add_argument("--protlake-path", type=str, required=True, help="Path to the Protlake directory to analyze")
     parser.add_argument("--snapshot-ver", type=int, required=True, help="DeltaLake snapshot version to use")
@@ -204,9 +217,14 @@ def main():
     design_dir = args.design_dir
     staging_path = args.staging_path
 
-    # get slurm environment variables
-    num_array_tasks = int(os.environ['SLURM_ARRAY_TASK_COUNT'])
-    my_task_id = int(os.environ['SLURM_ARRAY_TASK_ID'])
+    # get slurm environment variables, if not present assume debug mode and set to single task
+    if 'SLURM_ARRAY_TASK_COUNT' not in os.environ or 'SLURM_ARRAY_TASK_ID' not in os.environ:
+        print("Warning: SLURM environment variables not found, assuming debug mode with single task")
+        num_array_tasks = 1
+        my_task_id = 0
+    else:
+        num_array_tasks = int(os.environ['SLURM_ARRAY_TASK_COUNT'])
+        my_task_id = int(os.environ['SLURM_ARRAY_TASK_ID'])
 
     # connect to protlake
     shard_dir, delta_path = get_protlake_dirs(main_protlake_path)
