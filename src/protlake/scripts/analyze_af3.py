@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 
-import os, shutil
+import os
 import shlex
 import subprocess
 from deltalake import DeltaTable
-from utils import get_protlake_dirs
+from ..utils import get_protlake_dirs
 import argparse
 
 def main():
@@ -36,8 +36,8 @@ def main():
     else:
         staging_path = os.path.join(launcher_args.protlake_path, "delta_staging_table")
 
-    worker_script = "analyze.af3.worker"
-    merge_script = "analyze.af3.merge"
+    worker_script = "protlake.af3.analysis_worker"
+    merge_script = "protlake.af3.analysis_merge"
 
     # Get current version of the delta table
     _, delta_path = get_protlake_dirs(launcher_args.protlake_path)

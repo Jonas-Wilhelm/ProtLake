@@ -5,12 +5,11 @@ from deltalake import DeltaTable, write_deltalake
 from deltalake.schema import Field, PrimitiveType, StructType
 import pyarrow as pa
 import pyarrow.compute as pc
-from utils import get_protlake_dirs, DeltaTable_nrow, deltatable_maintenance
-from read import pread_bcif_to_atom_array, pread_json_msgpack_to_dict
+import protlake
+from ..utils import get_protlake_dirs, rmsd_sc_automorphic, DeltaTable_nrow, deltatable_maintenance
+from ..read import pread_bcif_to_atom_array, pread_json_msgpack_to_dict
 from biotite.structure import filter_peptide_backbone, superimpose, rmsd
 from biotite.structure.io import load_structure, save_structure
-from biotite.structure.atoms import coord
-from biotite.structure.util import vector_dot
 from biotite.structure.info import standardize_order
 from xxhash import xxh64
 import numpy as np
@@ -19,6 +18,7 @@ import itertools
 from pathlib import Path
 import importlib.util
 import argparse
+from pathlib import Path
 
 def _import_plugin_module(path: Path):
     spec = importlib.util.spec_from_file_location(path.stem, path)
@@ -93,19 +93,6 @@ def eval_scorefxns(scorefxns, aa_design, aa_af3, meta, confidences, sc_close_to_
 
             staging_columns.append(k, pa_val, pa_type)
 
-def _sq_euclidian(reference, subject):
-    '''
-    Squared Euclidian distance function from biotite
-    '''
-    reference_coord = coord(reference)
-    subject_coord = coord(subject)
-    if reference_coord.ndim != 2:
-        raise TypeError(
-            "Expected an AtomArray or an ndarray with shape (n,3) as reference"
-        )
-    dif = subject_coord - reference_coord
-    return vector_dot(dif, dif)
-
 def _expand_mask_to_residues(mask, aa):
     """
     Expand an atom selection (bool mask or list/array of atom indices) to a boolean
@@ -125,54 +112,6 @@ def _filter_atoms_close_to_hetero(aa, dist = 7.5):
     dists = np.linalg.norm(coords[:, None, :] - het_coords[None, :, :], axis=2)
     near_mask = dists.min(axis=1) <= 7.5
     return (near_mask & ~aa.hetero)
-
-def rmsd_sc_automorphic(reference, subject):
-    """
-    Compute the per-residue all-atom RMSD between two structures, accounting for
-    symmetry in selected sidechain atoms (e.g., OD1/OD2 in ASP). Returns the overall 
-    RMSD across all residues.
-    """
-    # TODO make this work with non complete residues (e.g. only last 3 atoms of PHE)
-    SYMMETRY_MAP = {
-        "ASP": [("OD1","OD2")],
-        "GLU": [("OE1","OE2")],
-        "PHE": [("CD1","CD2"), ("CE1","CE2")],
-        "TYR": [("CD1","CD2"), ("CE1","CE2")],
-        "ARG": [("NH1","NH2")],
-        "LEU": [("CD1","CD2")],
-        "VAL": [("CG1","CG2")],
-    }
-    chain = reference.chain_id.astype(str)
-    res   = reference.res_id.astype(str)
-    keys  = chain + ":" + res
-
-    boundaries = np.where(keys[:-1] != keys[1:])[0] + 1
-    groups = np.split(np.arange(reference.shape[0]), boundaries)
-
-    all_sd = np.array([], dtype=np.float32)
-    for atom_idx in groups:
-        res_name = reference[atom_idx[0]].res_name
-        sd = _sq_euclidian(reference[atom_idx], subject[atom_idx])
-        msd = np.mean(sd, axis=-1)
-        if res_name in SYMMETRY_MAP.keys():
-            atom_idx_swapped = atom_idx.copy()
-            atom_pairs = SYMMETRY_MAP[res_name]
-            for atom_pair in atom_pairs:
-                # check if both atoms in pair are present
-                if not (np.any(reference[atom_idx].atom_name == atom_pair[0]) and np.any(reference[atom_idx].atom_name == atom_pair[1])):
-                    continue
-                # swap their indices
-                idx_a = np.where(reference[atom_idx].atom_name == atom_pair[0])[0][0]
-                idx_b = np.where(reference[atom_idx].atom_name == atom_pair[1])[0][0]
-                atom_idx_swapped[idx_a], atom_idx_swapped[idx_b] = atom_idx_swapped[idx_b], atom_idx_swapped[idx_a]
-            sd_flip = _sq_euclidian(reference[atom_idx], subject[atom_idx_swapped])
-            msd_flip = np.mean(sd_flip, axis=-1)
-            if msd_flip < msd:
-                sd = sd_flip
-                msd = msd_flip
-        all_sd = np.append(all_sd, sd)
-
-    return np.sqrt(np.mean(all_sd, axis=-1))
 
 def _standardize_order_not_hetero(aa):
     aa[~aa.hetero] = aa[standardize_order(aa[~aa.hetero])]
@@ -196,13 +135,15 @@ class staging_col_dict:
 
 def main():
     # bootstrap parser to parse custom score function directory
+    default_scorefxn_dir = Path(protlake.__file__).resolve().parent / "af3" / "scorefxns"
     bootstrap_parser = argparse.ArgumentParser()
-    bootstrap_parser.add_argument("--custom-scorefxn-dir", default="analyze/af3/scorefxns", help="directory with scorer plugins")
+    bootstrap_parser.add_argument("--custom-scorefxn-dir", default=default_scorefxn_dir, help="Directory with score function plugins. default: protlake/af3/scorefxns")
     bootstrap_parser.add_argument("--scorefxns", type=str, nargs="+", default=None, help="Names of score functions to run (default: all in --custom-scorefxn-dir)")
     boot_args, remaining_argv = bootstrap_parser.parse_known_args()
 
     # main parser and load score functions
     parser = argparse.ArgumentParser(description="Run analysis")
+    print("Loading score functions from:", boot_args.custom_scorefxn_dir)
     scorefxns = load_scorefxns(plugin_dir=Path(boot_args.custom_scorefxn_dir), parser=parser, names=boot_args.scorefxns)
     print("Loaded score functions:", [s["name"] for s in scorefxns])
     parser.add_argument("--protlake-path", type=str, required=True, help="Path to the Protlake directory to analyze")

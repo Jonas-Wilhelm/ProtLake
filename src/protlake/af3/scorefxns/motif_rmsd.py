@@ -1,5 +1,5 @@
 import numpy as np
-from analyze.af3.worker import rmsd_sc_automorphic
+from protlake.utils import rmsd_sc_automorphic
 from biotite.structure import rmsd, superimpose
 
 scorefxn_name = "motif_rmsd"
