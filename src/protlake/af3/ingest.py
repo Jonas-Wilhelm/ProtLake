@@ -10,12 +10,10 @@ from dataclasses import dataclass
 from deltalake import write_deltalake, DeltaTable
 from deltalake.exceptions import DeltaError
 
-import pyarrow.compute as pc
-
 from biotite.structure.io import load_structure
 from biotite.structure.io.pdbx import BinaryCIFFile, set_structure, compress
 
-from utils import ensure_dirs, get_protlake_dirs
+from ..utils import ensure_dirs, get_protlake_dirs
 
 # --------------- Arrow schemas ---------------
 list_f32 = pa.list_(pa.float32())

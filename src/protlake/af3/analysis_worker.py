@@ -1,16 +1,15 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S PYTHONUNBUFFERED=1 python
 
 import os, time, sys, shutil
 from deltalake import DeltaTable, write_deltalake
 from deltalake.schema import Field, PrimitiveType, StructType
 import pyarrow as pa
 import pyarrow.compute as pc
-from utils import get_protlake_dirs, DeltaTable_nrow, deltatable_maintenance
-from read import pread_bcif_to_atom_array, pread_json_msgpack_to_dict
+import protlake
+from protlake.utils import get_protlake_dirs, rmsd_sc_automorphic, DeltaTable_nrow, deltatable_maintenance
+from protlake.read import pread_bcif_to_atom_array, pread_json_msgpack_to_dict
 from biotite.structure import filter_peptide_backbone, superimpose, rmsd
 from biotite.structure.io import load_structure, save_structure
-from biotite.structure.atoms import coord
-from biotite.structure.util import vector_dot
 from biotite.structure.info import standardize_order
 from xxhash import xxh64
 import numpy as np
@@ -19,6 +18,7 @@ import itertools
 from pathlib import Path
 import importlib.util
 import argparse
+from pathlib import Path
 
 def _import_plugin_module(path: Path):
     spec = importlib.util.spec_from_file_location(path.stem, path)
@@ -60,8 +60,8 @@ def _to_pa_scalar(val):
             return pa.float32(), float(val)
         if np.issubdtype(val.dtype, np.str_):
             return pa.string(), str(val)
-        if np.issubdtype(val.dtype, np.bool):
-            return pa.bool(), str(val)
+        if np.issubdtype(val.dtype, np.bool_):
+            return pa.bool_(), bool(val)
 
     # plain python types
     if isinstance(val, int):
@@ -93,19 +93,6 @@ def eval_scorefxns(scorefxns, aa_design, aa_af3, meta, confidences, sc_close_to_
 
             staging_columns.append(k, pa_val, pa_type)
 
-def _sq_euclidian(reference, subject):
-    '''
-    Squared Euclidian distance function from biotite
-    '''
-    reference_coord = coord(reference)
-    subject_coord = coord(subject)
-    if reference_coord.ndim != 2:
-        raise TypeError(
-            "Expected an AtomArray or an ndarray with shape (n,3) as reference"
-        )
-    dif = subject_coord - reference_coord
-    return vector_dot(dif, dif)
-
 def _expand_mask_to_residues(mask, aa):
     """
     Expand an atom selection (bool mask or list/array of atom indices) to a boolean
@@ -123,56 +110,8 @@ def _filter_atoms_close_to_hetero(aa, dist = 7.5):
     coords = aa.coord
     het_coords = coords[aa.hetero]
     dists = np.linalg.norm(coords[:, None, :] - het_coords[None, :, :], axis=2)
-    near_mask = dists.min(axis=1) <= 7.5
+    near_mask = dists.min(axis=1) <= dist
     return (near_mask & ~aa.hetero)
-
-def rmsd_sc_automorphic(reference, subject):
-    """
-    Compute the per-residue all-atom RMSD between two structures, accounting for
-    symmetry in selected sidechain atoms (e.g., OD1/OD2 in ASP). Returns the overall 
-    RMSD across all residues.
-    """
-    # TODO make this work with non complete residues (e.g. only last 3 atoms of PHE)
-    SYMMETRY_MAP = {
-        "ASP": [("OD1","OD2")],
-        "GLU": [("OE1","OE2")],
-        "PHE": [("CD1","CD2"), ("CE1","CE2")],
-        "TYR": [("CD1","CD2"), ("CE1","CE2")],
-        "ARG": [("NH1","NH2")],
-        "LEU": [("CD1","CD2")],
-        "VAL": [("CG1","CG2")],
-    }
-    chain = reference.chain_id.astype(str)
-    res   = reference.res_id.astype(str)
-    keys  = chain + ":" + res
-
-    boundaries = np.where(keys[:-1] != keys[1:])[0] + 1
-    groups = np.split(np.arange(reference.shape[0]), boundaries)
-
-    all_sd = np.array([], dtype=np.float32)
-    for atom_idx in groups:
-        res_name = reference[atom_idx[0]].res_name
-        sd = _sq_euclidian(reference[atom_idx], subject[atom_idx])
-        msd = np.mean(sd, axis=-1)
-        if res_name in SYMMETRY_MAP.keys():
-            atom_idx_swapped = atom_idx.copy()
-            atom_pairs = SYMMETRY_MAP[res_name]
-            for atom_pair in atom_pairs:
-                # check if both atoms in pair are present
-                if not (np.any(reference[atom_idx].atom_name == atom_pair[0]) and np.any(reference[atom_idx].atom_name == atom_pair[1])):
-                    continue
-                # swap their indices
-                idx_a = np.where(reference[atom_idx].atom_name == atom_pair[0])[0][0]
-                idx_b = np.where(reference[atom_idx].atom_name == atom_pair[1])[0][0]
-                atom_idx_swapped[idx_a], atom_idx_swapped[idx_b] = atom_idx_swapped[idx_b], atom_idx_swapped[idx_a]
-            sd_flip = _sq_euclidian(reference[atom_idx], subject[atom_idx_swapped])
-            msd_flip = np.mean(sd_flip, axis=-1)
-            if msd_flip < msd:
-                sd = sd_flip
-                msd = msd_flip
-        all_sd = np.append(all_sd, sd)
-
-    return np.sqrt(np.mean(all_sd, axis=-1))
 
 def _standardize_order_not_hetero(aa):
     aa[~aa.hetero] = aa[standardize_order(aa[~aa.hetero])]
@@ -194,21 +133,35 @@ class staging_col_dict:
     def __repr__(self):
         return repr(self.main_dict)
 
+def replace_ligand_atom_names(replacement_string, aa_af3):
+    for spec in replacement_string:
+        resname_pair, atom_string = spec.split("$")
+        resname_pair = tuple(resname_pair.split(":"))
+        atom_pairs = [tuple(s.split(":")) for s in atom_string.split(",")]
+        res_mask = (aa_af3.res_name == resname_pair[0])
+        for atom_pair in atom_pairs:
+            aa_af3.atom_name[res_mask & (aa_af3.atom_name == atom_pair[0])] = atom_pair[1]
+
+        aa_af3.res_name[res_mask] = resname_pair[1]
+
 def main():
     # bootstrap parser to parse custom score function directory
+    default_scorefxn_dir = Path(protlake.__file__).resolve().parent / "af3" / "scorefxns"
     bootstrap_parser = argparse.ArgumentParser()
-    bootstrap_parser.add_argument("--custom-scorefxn-dir", default="analyze/af3/scorefxns", help="directory with scorer plugins")
+    bootstrap_parser.add_argument("--custom-scorefxn-dir", default=default_scorefxn_dir, help="Directory with score function plugins. default: protlake/af3/scorefxns")
     bootstrap_parser.add_argument("--scorefxns", type=str, nargs="+", default=None, help="Names of score functions to run (default: all in --custom-scorefxn-dir)")
     boot_args, remaining_argv = bootstrap_parser.parse_known_args()
 
     # main parser and load score functions
     parser = argparse.ArgumentParser(description="Run analysis")
+    print("Loading score functions from:", boot_args.custom_scorefxn_dir)
     scorefxns = load_scorefxns(plugin_dir=Path(boot_args.custom_scorefxn_dir), parser=parser, names=boot_args.scorefxns)
     print("Loaded score functions:", [s["name"] for s in scorefxns])
     parser.add_argument("--protlake-path", type=str, required=True, help="Path to the Protlake directory to analyze")
     parser.add_argument("--snapshot-ver", type=int, required=True, help="DeltaLake snapshot version to use")
     parser.add_argument("--staging-path", type=str, required=True, help="Path to the staging directory, default: <protlake-path>/delta_staging_table")
     parser.add_argument("--design-dir", type=str, required=True, help="Path to the design directory")
+    parser.add_argument("--replace_lig_atom_names", type=str, nargs="+", help="Residue names and atom names to replace in the AF3 output, example: LIG_B:FE1$FE:FE")
 
     # parse arguments
     args = parser.parse_args(remaining_argv)
@@ -217,14 +170,15 @@ def main():
     design_dir = args.design_dir
     staging_path = args.staging_path
 
-    # get slurm environment variables, if not present assume debug mode and set to single task
+    # get slurm environment variables, if not present assume local mode and set to single task
     if 'SLURM_ARRAY_TASK_COUNT' not in os.environ or 'SLURM_ARRAY_TASK_ID' not in os.environ:
-        print("Warning: SLURM environment variables not found, assuming debug mode with single task")
+        print("Warning: SLURM environment variables not found, assuming local mode with single task")
         num_array_tasks = 1
         my_task_id = 0
     else:
         num_array_tasks = int(os.environ['SLURM_ARRAY_TASK_COUNT'])
         my_task_id = int(os.environ['SLURM_ARRAY_TASK_ID'])
+        print(f"Running in SLURM mode with {num_array_tasks} array tasks, this is task {my_task_id}")
 
     # connect to protlake
     shard_dir, delta_path = get_protlake_dirs(main_protlake_path)
@@ -234,14 +188,13 @@ def main():
     scanner = ds.scanner(
         # columns=["name"],       # project only what you need
         # filter=pc.field("col_c") < 9,              # pushdown what you can
-        batch_size=1_000_000
+        batch_size=100_000
     )
-
-    # initialize staging columns dict
-    staging_columns = staging_col_dict()
     
     # process each batch
-    for batch in scanner.to_batches():
+    for batch in scanner.to_batches():    
+        # initialize staging columns dict
+        staging_columns = staging_col_dict()
         start_time = time.time()
         names = batch["name"].to_numpy(zero_copy_only=False)
         order = np.argsort(names)
@@ -276,11 +229,17 @@ def main():
                 aa_design
             )
             sc_close_to_het_mask = (close_to_het_mask & ~bb_mask)
+            OXT_present_design = np.any(aa_design.atom_name == "OXT")
             for row in rows:
                 # ------------ import structure and meta data ------------
                 meta = batch.slice(row, 1).to_pylist()[0]
                 
-                aa_af3 = pread_bcif_to_atom_array(os.path.join(shard_dir, meta["bcif_shard"]), meta["bcif_off"], meta["bcif_len"])
+                aa_af3 = pread_bcif_to_atom_array(os.path.join(shard_dir, meta["bcif_shard"]), meta["bcif_data_off"], meta["bcif_len"])
+                if not OXT_present_design:
+                    # remove OXT if not present in design
+                    OXT_mask = (aa_af3.atom_name == "OXT") & ~aa_af3.hetero
+                    OXT_indexes = np.where(OXT_mask)[0]
+                    aa_af3 = aa_af3[~OXT_mask]
                 if aa_af3[~aa_af3.hetero].shape[0] != aa_design[~aa_design.hetero].shape[0]:
                     print(f"Warning: Different number of (non H) atoms in in design model and af3 prediction for {name}, sample {meta['sample']}, seed {meta['seed']}")
                     continue
@@ -288,14 +247,22 @@ def main():
                     print(f"Warning: Missmatch of atom names in in design model and af3 prediction for {name}, sample {meta['sample']}, seed {meta['seed']}")
                     continue
 
+                if args.replace_lig_atom_names is not None:
+                    replace_ligand_atom_names(args.replace_lig_atom_names, aa_af3)
+
                 aa_af3, _ = superimpose(aa_design, aa_af3, atom_mask=CA_mask)
                 
-                confidences = pread_json_msgpack_to_dict(os.path.join(shard_dir, meta["json_shard"]), meta["json_off"], meta["json_len"])
-                # convert all numeric lists to numpy arrays
+                confidences = pread_json_msgpack_to_dict(os.path.join(shard_dir, meta["json_shard"]), meta["json_data_off"], meta["json_len"])
+                # convert lists to numpy arrays
                 confidences = {
-                    k: np.asarray(v) if isinstance(v, list) and all(isinstance(x, (int, float, list)) for x in v) else v for k, v in confidences.items()
+                    k: np.asarray(v) if isinstance(v, list) and all(isinstance(x, (int, float, list, str)) for x in v) else v for k, v in confidences.items()
                 }
-                
+
+                if not OXT_present_design and np.any(OXT_mask):
+                    # remove OXT from confidence metrics as well
+                    confidences['atom_chain_ids'] = confidences['atom_chain_ids'][~OXT_mask]
+                    confidences['atom_plddts'] = confidences['atom_plddts'][~OXT_mask]
+
                 # ------------ calculate base metrics ------------
                 staging_columns.append("id_hex", meta["id_hex"], pa.string())
 
@@ -316,7 +283,7 @@ def main():
                     staging_columns.append("pLDDT_SC_around_lig", pLDDT_SC_around_lig)
 
                     RMSD_SC_around_lig = rmsd_sc_automorphic(aa_design[sc_close_to_het_mask], aa_af3[sc_close_to_het_mask])
-                    staging_columns.append("RMSD_CS_around_lig", RMSD_SC_around_lig)
+                    staging_columns.append("RMSD_SC_around_lig", RMSD_SC_around_lig)
 
                     pLDDT_LIGs = {k: np.mean(confidences["atom_plddts"][aa_af3.res_name == k], dtype=np.float32) for k in np.unique(aa_af3[aa_af3.hetero].res_name)}
                     for key, val in pLDDT_LIGs.items():

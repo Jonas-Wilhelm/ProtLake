@@ -1,8 +1,7 @@
 import os, shutil
 from deltalake import DeltaTable
-from utils import deltatable_maintenance
+from ..utils import deltatable_maintenance, get_protlake_dirs, DeltaTable_nrow
 import argparse
-from utils import get_protlake_dirs, DeltaTable_nrow
 
 def main():
     parser = argparse.ArgumentParser()
