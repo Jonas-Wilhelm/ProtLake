@@ -31,8 +31,21 @@ def _update_best_rmsd(current_best, reference, subject):
 
 def score(aa_design, aa_af3, meta, confidences, sc_close_to_het_mask, CLI_args):
 
-    atom_names_rmsd = {s.split('$')[0]: np.array(s.split('$')[1].split(':'), dtype='<U6') for s in CLI_args.atom_names_rmsd}
-    chem_eq_atoms = {s.split('$')[0]: np.array([x.split(':') for x in s.split('$')[1].split('_')]) for s in CLI_args.chem_eq_atoms}
+    if CLI_args.atom_names_rmsd is not None:
+        atom_names_rmsd = {s.split('$')[0]: np.array(s.split('$')[1].split(':'), dtype='<U6') for s in CLI_args.atom_names_rmsd}
+    else:
+        # fill atom_names_rmsd with every ligand and every atom name found in the af3 structure 
+        # (requires ligand and atom names to be identical in design model and af3 prediction)
+        hetero_resnames = np.unique(aa_af3[aa_af3.hetero].res_name)
+        atom_names_rmsd = {}
+        for resname in hetero_resnames:
+            atom_names = np.unique(aa_af3[_resname_mask(aa_af3, resname)].atom_name)
+            atom_names_rmsd[f"{resname}:{resname}"] = atom_names
+        
+    if CLI_args.chem_eq_atoms is not None:
+        chem_eq_atoms = {s.split('$')[0]: np.array([x.split(':') for x in s.split('$')[1].split('_')]) for s in CLI_args.chem_eq_atoms}
+    else:
+        chem_eq_atoms = {}
 
     LIG_rmsds = {}
 

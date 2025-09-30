@@ -16,8 +16,10 @@ def main():
                         help="Path to the Protlake directory to analyze")
     parser.add_argument("--staging-path", type=str, required=False,
                         help="Path to the staging deltatable, default: <protlake-path>/delta_staging_table")
-    parser.add_argument("--debug", action="store_true", 
-                        help="Run in debug mode (no SLURM, single task)")
+    parser.add_argument("--local", action="store_true", 
+                        help="Run in local mode (no SLURM, single task)")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="If set, the commands will be printed but not executed")
     parser.add_argument("--log-dir", type=str, default="log_slurm",
                         help="Directory to write SLURM log files to")
     parser.add_argument("--dont-delete-staging-table", action="store_true", 
@@ -68,17 +70,20 @@ def main():
             f"--wrap", wrap_cmd
         ]
 
-        if launcher_args.debug:
-            print("Running in debug mode, executing worker script directly")
-            os.environ['SLURM_ARRAY_TASK_ID'] = '0'
-            os.environ['SLURM_ARRAY_TASK_COUNT'] = str(launcher_args.num_tasks)
-            # directly call the worker script
-            subprocess.run(shlex.split(wrap_cmd), check=True)
-            return
-        
-        print("Submitting array job with command:", " ".join(sbatch_cmd))
-        job_id = subprocess.check_output(sbatch_cmd, text=True).strip()
-        print(f"Submitted array job {job_id}")
+        if launcher_args.local:
+            print("Running in local mode, executing worker script directly")
+            print("Executing command:\n", wrap_cmd)
+            if launcher_args.dry_run:
+                print("Dry run mode, not executing command")
+            else:
+                subprocess.run(shlex.split(wrap_cmd), check=True)
+        else:
+            print("Submitting array job with command:\n", " ".join(sbatch_cmd))
+            if launcher_args.dry_run:
+                print("Dry run mode, not submitting job")
+            else:
+                job_id = subprocess.check_output(sbatch_cmd, text=True).strip()
+                print(f"Submitted array job {job_id}")
 
     # Submit follow-up job to merge results
     if launcher_args.dont_merge:
@@ -104,13 +109,18 @@ def main():
         f"--output={launcher_args.log_dir}/merge_%A.out",
         f"--error={launcher_args.log_dir}/merge_%A.out",
         f"--parsable",
-        f"--dependency=afterok:{job_id}",
         "--wrap", merge_wrap_cmd
     ]
 
-    print("Submitting follow-up merge job with command:", " ".join(merge_cmd))
-    merge_job_id = subprocess.check_output(merge_cmd, text=True).strip()
-    print(f"Submitted merge job {merge_job_id} (depends on {job_id})")
+    if not launcher_args.merge_only:
+        merge_cmd.append(f"--dependency=afterok:{job_id}")
+
+    print("Submitting follow-up merge job with command:\n", " ".join(merge_cmd))
+    if launcher_args.dry_run:
+        print("Dry run mode, not submitting merge job")
+    else:
+        merge_job_id = subprocess.check_output(merge_cmd, text=True).strip()
+        print(f"Submitted merge job {merge_job_id} (depends on {job_id})")
 
 
 if __name__ == "__main__":
