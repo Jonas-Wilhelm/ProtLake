@@ -4,9 +4,9 @@ from datetime import timedelta
 import pyarrow as pa
 from deltalake import DeltaTable
 sys.path.append("/home/jonaswil/Software/ProtLake")
-from utils import deltatable_maintenance, get_protlake_dirs
-from write import IngestConfig, AF3IngestPipeline
-from read import pread_bytes, bcif_bytes_to_atom_array
+from protlake.utils import deltatable_maintenance, get_protlake_dirs
+from protlake.af3.ingest import IngestConfig, AF3IngestPipeline
+from protlake.read import pread_bytes, bcif_bytes_to_atom_array
 from biotite.structure.io.pdbx import BinaryCIFFile, CIFFile, set_structure, compress, get_structure
 
 

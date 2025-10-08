@@ -3,7 +3,7 @@
 import os, time, sys
 from datetime import timedelta
 sys.path.append("/home/jonaswil/Software/ProtLake")
-from write import IngestConfig, AF3IngestPipeline
+from protlake.af3.ingest import IngestConfig, AF3IngestPipeline
 import argparse
 
 parser = argparse.ArgumentParser(description="Process AF3 output directories and ingest into ProtLake.")

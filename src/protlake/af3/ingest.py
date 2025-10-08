@@ -1,4 +1,4 @@
-import os, io, json, time, hashlib, zlib, fcntl, msgpack, atexit, shutil, uuid, random, warnings
+import os, io, json, time, hashlib, zlib, fcntl, msgpack, atexit, shutil, uuid, random, warnings, atexit
 from typing import Iterator, Optional, TypedDict, Dict, Any, List, Tuple
 import zstandard as zstd
 import numpy as np
@@ -10,10 +10,8 @@ from dataclasses import dataclass
 from deltalake import write_deltalake, DeltaTable
 from deltalake.exceptions import DeltaError
 
-from biotite.structure.io import load_structure
-from biotite.structure.io.pdbx import BinaryCIFFile, set_structure, compress
-
-from ..utils import ensure_dirs, get_protlake_dirs
+from protlake.utils import ensure_dirs, get_protlake_dirs
+from protlake.read import cif_to_bcif_bytes, cif_bytes_to_bcif_bytes
 
 # --------------- Arrow schemas ---------------
 list_f32 = pa.list_(pa.float32())
@@ -86,15 +84,15 @@ def parse_seed_sample(subdir_name: str) -> Tuple[int, int]:
             sample = int(p.replace("sample-", ""))
     return seed, sample
 
-# --------------- CIF codec ---------------
-def cif_to_bcif_bytes(cif_path: str, rtol: float = 1e-6, atol: float = 1e-4) -> bytes:
-    atom_array = load_structure(cif_path, extra_fields=['b_factor'])
-    bcif = BinaryCIFFile()
-    set_structure(bcif, atom_array)
-    bcif = compress(bcif, rtol=rtol, atol=atol)
-    buf = io.BytesIO()
-    bcif.write(buf)
-    return buf.getvalue()
+# --------------- JSON helpers ---------------
+def _serialize_af3_StructureConfidence_dict(obj):
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    if isinstance(obj, list):
+        return [_serialize_af3_StructureConfidence_dict(v) for v in obj]
+    if isinstance(obj, dict):
+        return {k: _serialize_af3_StructureConfidence_dict(v) for k, v in obj.items()}
+    return obj
 
 # --------------- small container format (PACK) ---------------
 MAGIC   = b"PACK"
@@ -409,6 +407,9 @@ class DeltaAppender:
         self.max_sleep = max_sleep
         self.jitter = jitter
 
+    def row_count(self) -> int:
+        return len(self.buf[self.schema[0].name])
+
     def add_row(self, row: Dict[str, Any]) -> None:
         # Strictly adhere to schema fields; missing fields become None
         for f in self.schema:
@@ -429,9 +430,7 @@ class DeltaAppender:
             return
         
         tbl = pa.Table.from_pydict(self.buf, schema=self.schema)
-
         delay = self.base_sleep
-
         for attempt in range(1, self.max_retries + 1):
             try:
                 # mode="append" will create table if missing
@@ -449,7 +448,6 @@ class DeltaAppender:
                 # not retryable or out of retries
                 print(f"ERROR: write_deltalake failed permanently after {attempt} attempts.")
                 raise
-
 
         for k in self.buf:
             self.buf[k].clear()
@@ -639,3 +637,106 @@ class AF3IngestPipeline:
         # Final flush
         self.delta_appender.flush()
 
+class AF3ProtlakeWriter:
+    def __init__(self, cfg: IngestConfig):
+        self.cfg = cfg
+        self.shard_dir, self.delta_path = get_protlake_dirs(cfg.out_path)
+        ensure_dirs([self.shard_dir, self.delta_path])
+
+        self.bcif_packer = ShardPackWriter(
+            self.shard_dir, 
+            prefix=cfg.bcif_shard_prefix, 
+            max_bytes=cfg.shard_size,
+            use_claims=cfg.claim_mode, 
+            claim_ttl=cfg.claim_ttl
+        )
+
+        if cfg.write_json_shards:
+            self.json_packer = ShardPackWriter(
+                self.shard_dir, 
+                prefix=cfg.json_shard_prefix, 
+                max_bytes=cfg.shard_size,
+                use_claims=cfg.claim_mode, 
+                claim_ttl=cfg.claim_ttl
+            )
+
+        self.delta_appender = DeltaAppender(self.delta_path, CORE_SCHEMA, batch_size=cfg.batch_size_metadata)
+        self.loader = MetadataLoader()
+        self.scanner = RunScanner()
+
+        warnings.filterwarnings(
+            "ignore", 
+            message="Attribute 'auth_.*_id' not found within 'atom_site' category", 
+            category=UserWarning, 
+            module="biotite.structure"
+        )
+
+        # Ensure final flush on exit
+        atexit.register(self.finalize)
+    
+    def write(
+        self,
+        cif: bytes,
+        summary_confidences: dict,
+        confidences: dict,
+        name: str,
+        sample_idx: int,
+        seed: int,
+    ) -> None:
+        # pick shards for this run
+        bcif_shard_path = self.bcif_packer.choose_shard()  # guarantees same shard per input_dir
+        if self.cfg.write_json_shards:
+            json_shard_path = self.json_packer.choose_shard()  # guarantees same shard per input_dir
+        
+        bcif_bytes = cif_bytes_to_bcif_bytes(cif, rtol=self.cfg.rtol, atol=self.cfg.atol)
+
+        if self.cfg.write_json_shards:
+            json_pack_bytes = msgpack.packb(
+                _serialize_af3_StructureConfidence_dict(
+                    confidences
+                ), 
+                use_bin_type=True
+            )
+            
+            compressor = zstd.ZstdCompressor(level=3)
+            json_pack_bytes_comp = compressor.compress(json_pack_bytes)
+            # Append json to shard
+            json_pack = self.json_packer.append(json_shard_path, json_pack_bytes_comp, rec_id=None)
+            if self.cfg.verbose:
+                print(f"packed id={json_pack['id_hex'][:12]}…  shard={os.path.basename(json_pack['shard_path'])} off={json_pack['off']} len={json_pack['length']}")
+
+        # Append cif to shard
+        bcif_pack = self.bcif_packer.append(bcif_shard_path, bcif_bytes, rec_id=None)
+        if self.cfg.verbose:
+            print(f"packed id={bcif_pack['id_hex'][:12]}…  shard={os.path.basename(bcif_pack['shard_path'])} off={bcif_pack['off']} len={bcif_pack['length']}")
+
+        # Build rows
+        common = dict(
+            id=bcif_pack["id_bytes"],
+            id_hex=bcif_pack["id_hex"],
+            name=name,
+            sample=sample_idx,
+            seed=seed,
+            bcif_shard=bcif_pack["shard_path"],
+            bcif_off=int(bcif_pack["off"]),
+            bcif_data_off=int(bcif_pack["data_off"]),
+            bcif_len=int(bcif_pack["length"]),
+        )
+        if self.cfg.write_json_shards:
+            common.update(
+                json_shard=json_pack["shard_path"],
+                json_off=int(json_pack["off"]),
+                json_data_off=int(json_pack["data_off"]),
+                json_len=int(json_pack["length"]),
+            )
+        else:
+            common.update(json_shard="", json_off=0, json_data_off=0, json_len=0)
+
+        summary_confidences = _serialize_af3_StructureConfidence_dict(summary_confidences)
+        delta_row: CoreRow = {**common, **{k: summary_confidences.get(k) for k in [f.name for f in CORE_SCHEMA] if k in summary_confidences}}
+        self.delta_appender.add_row(delta_row)
+    
+    def finalize(self) -> None:
+        print("Finalizing AF3ProtlakeWriter")
+        print(f"  Flushing {self.delta_appender.row_count()} rows")
+        self.delta_appender.flush()

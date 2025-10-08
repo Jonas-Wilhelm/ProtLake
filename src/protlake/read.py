@@ -1,6 +1,6 @@
 import os, io, zlib
-from biotite.structure.io.pdbx import BinaryCIFFile, get_structure, set_structure, CIFFile
-from biotite.structure.io import save_structure
+from biotite.structure.io.pdbx import BinaryCIFFile, get_structure, set_structure, CIFFile, compress
+from biotite.structure.io import save_structure, load_structure
 import zstandard as zstd
 import msgpack
 import pyarrow as pa
@@ -64,6 +64,28 @@ def pread_json_msgpack_to_dict(path, offset, length):
     decompressor = zstd.ZstdDecompressor()
     json_msgpack_bytes = decompressor.decompress(json_msgpack_bytes_comp)
     return msgpack.unpackb(json_msgpack_bytes, raw=False)
+
+def cif_to_bcif_bytes(cif_path: str, rtol: float = 1e-6, atol: float = 1e-4) -> bytes:
+    """ Converts a mmCIF file (e.g. from AF3) to binary CIF (bcif) format."""
+    atom_array = load_structure(cif_path, extra_fields=['b_factor'])
+    bcif = BinaryCIFFile()
+    set_structure(bcif, atom_array)
+    bcif = compress(bcif, rtol=rtol, atol=atol)
+    buf = io.BytesIO()
+    bcif.write(buf)
+    return buf.getvalue()
+
+def cif_bytes_to_bcif_bytes(cif_data: bytes, rtol: float = 1e-6, atol: float = 1e-4) -> bytes:
+    """ Converts utf-8 encoded mmCIF bytes (e.g. from AF3) to binary CIF (bcif) format."""
+    f = io.StringIO(cif_data.decode('utf-8'))
+    cif = CIFFile.read(f)
+    atom_array = get_structure(cif, extra_fields=['b_factor'], model=1)
+    bcif = BinaryCIFFile()
+    set_structure(bcif, atom_array)
+    bcif = compress(bcif, rtol=rtol, atol=atol)
+    buf = io.BytesIO()
+    bcif.write(buf)
+    return buf.getvalue()
 
 # def get_row_from_deltalake_simple(dt, row_dict):
 #     ''' Get a single row from a Delta Lake table matching the criteria in row_dict'''
