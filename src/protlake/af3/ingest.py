@@ -3,6 +3,7 @@ from typing import Iterator, Optional, TypedDict, Dict, Any, List, Tuple
 import zstandard as zstd
 import numpy as np
 import pyarrow as pa
+import pyarrow.dataset as ds
 
 from socket import gethostname
 from dataclasses import dataclass
@@ -673,7 +674,62 @@ class AF3ProtlakeWriter:
 
         # Ensure final flush on exit
         atexit.register(self.finalize)
+
+    def check_exists(self, name: str, seed: int, sample_idx: int) -> bool:
+        if not os.path.exists(os.path.join(self.delta_path, "_delta_log")):
+            print("Delta table does not exist yet; no entries found.")
+            return False
+        dt = DeltaTable(f"file://{os.path.abspath(self.delta_path)}")
+        pa_dataset = dt.to_pyarrow_dataset(columns=["name", "seed", "sample"])
+
+        cond = (ds.field("name") == name) & (ds.field("seed") == seed) & (ds.field("sample") == sample_idx)
+        scanner = pa_dataset.scanner(filter=cond, columns=["name", "seed", "sample"])
+
+        for batch in scanner.to_batches():
+            if batch.num_rows > 0:
+                return True
+
+        return False
+
+    def check_exists_complete(self, name: str, seeds: tuple[int], sample_idx: tuple[int]) -> bool:
+        if not os.path.exists(os.path.join(self.delta_path, "_delta_log")):
+            print("Delta table does not exist yet; no entries found.")
+            return False
+        dt = DeltaTable(f"file://{os.path.abspath(self.delta_path)}")
+        pa_dataset = dt.to_pyarrow_dataset()
+
+        expr = ds.field("name") == name
+        scanner = pa_dataset.scanner(filter=expr, columns=["seed", "sample"])
+
+        target = {(s, si) for s in seeds for si in sample_idx}
+        found = set()
+
+        for batch in scanner.to_batches():
+            seeds_batch = batch.column("seed").to_pylist()
+            samples_batch = batch.column("sample").to_pylist()
+            for s_val, samp_val in zip(seeds_batch, samples_batch):
+                tup = (s_val, samp_val)
+                if tup in target:
+                    found.add(tup)
+            if len(found) == len(target):   # early stop as soon as we've found all combos
+                break
+        
+        missing = sorted(target - found)
+        if len(missing) == 0:
+            return True, None
+        if len(missing) == len(target):
+            return False, 'all_missing'
+        else:
+            print(f"Found only {len(found)}/{len(target)} entries for name={name}. Missing: {missing}")
+            return False, 'partial_missing'
     
+    def remove_entries(self, name: str) -> None:
+        if not os.path.exists(os.path.join(self.delta_path, "_delta_log")):
+            print("Delta table does not exist yet; no entries found.")
+            return
+        dt = DeltaTable(f"file://{os.path.abspath(self.delta_path)}")
+        dt.delete(f"name = '{name}'")
+
     def write(
         self,
         cif: bytes,
