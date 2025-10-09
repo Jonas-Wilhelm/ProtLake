@@ -95,6 +95,25 @@ def _serialize_af3_StructureConfidence_dict(obj):
         return {k: _serialize_af3_StructureConfidence_dict(v) for k, v in obj.items()}
     return obj
 
+def _round_af3_StructureConfidence_dict(d):
+    """
+    Round floats in AF3 StructureConfidence dict to 1 or 2 decimal places.
+    Drastically reduces compressed size about 5 fold.
+    """
+    def round_recursive(x, digits):
+        if isinstance(x, float):
+            return round(x, digits)
+        elif isinstance(x, list):
+            return [round_recursive(i, digits) for i in x]
+        else:
+            return x
+
+    for k, v in d.items():
+        digits = 1 if k == "pae" else 2
+        d[k] = round_recursive(v, digits)
+
+    return d
+
 # --------------- small container format (PACK) ---------------
 MAGIC   = b"PACK"
 VERSION = 1
@@ -383,20 +402,14 @@ class ShardPackWriter:
                 os.utime(claim_dir, None)  # heartbeat
             except Exception:
                 pass
-            # # Release claim if shard is full
-            # try:
-            #     if os.path.exists(shard_path) and os.path.getsize(shard_path) >= self.max_bytes:
-            #         self.release_shard(shard_path)
-            # except Exception:
-            #     pass
 
         return {"id_hex": id_hex, "id_bytes": rec_id, "off": off, "data_off": data_off, "length": data_len, "shard_path": os.path.basename(shard_path)}
 
 # --------------- Delta appenders ---------------
 class DeltaAppender:
     """Buffer rows per schema and flush to a Delta table via deltalake."""
-    def __init__(self, table_path: str, schema: pa.Schema, batch_size: int = 2500,
-                 max_retries: int = 20, base_sleep: float = 0.05, max_sleep: float = 10.0, jitter: float = 0.1):
+    def __init__(self, table_path: str, schema: pa.Schema, batch_size: int = 2500, max_retries: int = 20,
+                 base_sleep: float = 0.05, max_sleep: float = 10.0, jitter: float = 0.1):
         self.table_uri = f"file://{os.path.abspath(table_path)}"
         self.schema = schema
         self.batch_size = batch_size
@@ -419,7 +432,11 @@ class DeltaAppender:
             self.flush()
 
     def _is_retryable_delta_error(self, e: Exception) -> bool:
-        # only retry known concurrency conflicts
+        """
+        only retry known concurrency conflicts:
+          - version 0 already exists
+        (most concurrency conflicts are retried internally by deltalake)
+        """
         msg = str(e).lower()
         retryable_phrases = [
             "version 0 already exists",
@@ -587,7 +604,7 @@ class AF3IngestPipeline:
                 if self.cfg.write_json_shards:
                     heavy = self.loader.load_heavy(input_dir, item["run_name"], item["subdir"])
                     json_pack_bytes = msgpack.packb(heavy, use_bin_type=True)
-                    compressor = zstd.ZstdCompressor(level=3)
+                    compressor = zstd.ZstdCompressor(level=12)
                     json_pack_bytes_comp = compressor.compress(json_pack_bytes)
                     # Append json to shard
                     json_pack = self.json_packer.append(json_shard_path_for_run, json_pack_bytes_comp, rec_id=None)
@@ -748,13 +765,16 @@ class AF3ProtlakeWriter:
 
         if self.cfg.write_json_shards:
             json_pack_bytes = msgpack.packb(
-                _serialize_af3_StructureConfidence_dict(
-                    confidences
-                ), 
-                use_bin_type=True
+                _round_af3_StructureConfidence_dict(
+                    _serialize_af3_StructureConfidence_dict(
+                        confidences
+                    )
+                ),
+                use_bin_type=True,
+                use_single_float=True
             )
-            
-            compressor = zstd.ZstdCompressor(level=3)
+
+            compressor = zstd.ZstdCompressor(level=12)
             json_pack_bytes_comp = compressor.compress(json_pack_bytes)
             # Append json to shard
             json_pack = self.json_packer.append(json_shard_path, json_pack_bytes_comp, rec_id=None)

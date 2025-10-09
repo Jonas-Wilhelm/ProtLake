@@ -1,6 +1,6 @@
 import os, shutil
 from deltalake import DeltaTable
-from ..utils import deltatable_maintenance, get_protlake_dirs, DeltaTable_nrow
+from protlake.utils import deltatable_maintenance, get_protlake_dirs, DeltaTable_nrow
 import argparse
 
 def main():

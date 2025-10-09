@@ -1,7 +1,10 @@
 import os
 from typing import overload, Optional
 from deltalake import DeltaTable
-from protlake.utils import DeltaTable_nrow, deltatable_maintenance
+from protlake.utils import (
+    DeltaTable_nrow, 
+    deltatable_maintenance
+)
 from protlake.read import (
     bcif_shard_to_mmCIF_file,
     pread_bcif_to_atom_array

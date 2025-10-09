@@ -1,6 +1,15 @@
 import os, io, zlib
-from biotite.structure.io.pdbx import BinaryCIFFile, get_structure, set_structure, CIFFile, compress
-from biotite.structure.io import save_structure, load_structure
+from biotite.structure.io.pdbx import (
+    BinaryCIFFile, 
+    get_structure, 
+    set_structure, 
+    CIFFile, 
+    compress
+)
+from biotite.structure.io import (
+    save_structure, 
+    load_structure
+)
 import zstandard as zstd
 import msgpack
 import pyarrow as pa
