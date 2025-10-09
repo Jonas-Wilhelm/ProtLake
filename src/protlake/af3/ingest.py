@@ -691,10 +691,10 @@ class AF3ProtlakeWriter:
 
         return False
 
-    def check_exists_complete(self, name: str, seeds: tuple[int], sample_idx: tuple[int]) -> bool:
+    def check_exists_complete(self, name: str, seeds: tuple[int], sample_idx: tuple[int]) -> Tuple[bool, Optional[str]]:
         if not os.path.exists(os.path.join(self.delta_path, "_delta_log")):
             print("Delta table does not exist yet; no entries found.")
-            return False
+            return False, 'all_missing'
         dt = DeltaTable(f"file://{os.path.abspath(self.delta_path)}")
         pa_dataset = dt.to_pyarrow_dataset()
 
