@@ -1,6 +1,6 @@
 import os
 from typing import overload, Optional
-from deltalake import DeltaTable
+from deltalake import DeltaTable, write_deltalake
 from protlake.utils import (
     DeltaTable_nrow, 
     deltatable_maintenance
@@ -9,25 +9,50 @@ from protlake.read import (
     bcif_shard_to_mmCIF_file,
     pread_bcif_to_atom_array
 )
+from protlake.af3.ingest import CORE_SCHEMA
+import pyarrow as pa
 import pandas as pd
 import numpy as np
 from biotite.structure import to_sequence
 
 class ProtLake():
-    def __init__(self, path):
+    def __init__(self, path, create=False):
         self.path = path
         self.delta_path = os.path.join(path, 'delta')
         self.shard_path = os.path.join(path, 'shards')
+        self.n_row = None
 
         self.dt = None
-        self.load()
+        self.load(create=create)
 
-    def load(self) -> bool:
-        self.dt = DeltaTable(f"file://{os.path.abspath(self.delta_path)}")
-        self.nrow = DeltaTable_nrow(self.dt)
+    def load(self, create=False) -> bool:
+        try:
+            self.dt = DeltaTable(f"file://{os.path.abspath(self.delta_path)}")
+            if create:
+                print(f"ProtLake at {self.path} already exists, not creating a new one, despite create=True.")
+        except Exception as e:
+            if create:
+                print(f"Creating new ProtLake at {self.path}")
+                os.makedirs(self.delta_path, exist_ok=True)
+                os.makedirs(self.shard_path, exist_ok=True)
+                empty = pa.table(
+                    {f.name: pa.array([], type=f.type) for f in CORE_SCHEMA}
+                )
+                write_deltalake(
+                    f"file://{os.path.abspath(self.delta_path)}",
+                    empty,
+                    configuration={'delta.checkpointInterval': '500'}
+                )
+                self.dt = DeltaTable(f"file://{os.path.abspath(self.delta_path)}")
+            else:
+                raise RuntimeError(f"Could not load ProtLake at {self.path}: {e}")
         self.colnames = [f.name for f in self.dt.schema().fields]
         return True
-    
+
+    def nrow(self) -> int:
+        self.n_row = DeltaTable_nrow(self.dt)
+        return self.n_row
+
     def to_pandas(self) -> pd.DataFrame:
         return self.dt.to_pandas()
     
