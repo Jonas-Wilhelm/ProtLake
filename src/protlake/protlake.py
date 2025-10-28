@@ -3,9 +3,7 @@ from typing import overload, Optional
 from deltalake import DeltaTable, write_deltalake
 from protlake.utils import (
     DeltaTable_nrow, 
-    deltatable_maintenance
-)
-from protlake.read import (
+    deltatable_maintenance,
     bcif_shard_to_mmCIF_file,
     pread_bcif_to_atom_array
 )

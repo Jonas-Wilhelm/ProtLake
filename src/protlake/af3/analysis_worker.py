@@ -1,20 +1,22 @@
 #!/usr/bin/env -S PYTHONUNBUFFERED=1 python
 
-import os, time, sys, shutil
+import os, time
 from deltalake import DeltaTable, write_deltalake
-from deltalake.schema import Field, PrimitiveType, StructType
 import pyarrow as pa
 import pyarrow.compute as pc
 import protlake
-from protlake.utils import get_protlake_dirs, rmsd_sc_automorphic, DeltaTable_nrow, deltatable_maintenance
-from protlake.read import pread_bcif_to_atom_array, pread_json_msgpack_to_dict
+from protlake.utils import (
+    get_protlake_dirs, 
+    rmsd_sc_automorphic, 
+    pread_bcif_to_atom_array, 
+    pread_json_msgpack_to_dict
+)
 from biotite.structure import filter_peptide_backbone, superimpose, rmsd
 from biotite.structure.io import load_structure, save_structure
 from biotite.structure.info import standardize_order
 from xxhash import xxh64
 import numpy as np
 import pandas as pd
-import itertools
 from pathlib import Path
 import importlib.util
 import argparse

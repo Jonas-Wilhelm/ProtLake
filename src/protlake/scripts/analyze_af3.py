@@ -4,7 +4,7 @@ import os
 import shlex
 import subprocess
 from deltalake import DeltaTable
-from ..utils import get_protlake_dirs
+from protlake.utils import get_protlake_dirs
 import argparse
 
 def main():

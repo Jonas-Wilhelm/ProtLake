@@ -2,7 +2,7 @@
 
 import os
 from deltalake import DeltaTable
-from protlake.read import dump_cif_from_deltalake_row
+from protlake.utils import dump_cif_from_deltalake_row
 import argparse
 
 def main():

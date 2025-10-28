@@ -12,8 +12,7 @@ from deltalake import write_deltalake, DeltaTable
 from deltalake.exceptions import DeltaError
 
 import protlake
-from protlake.utils import ensure_dirs, get_protlake_dirs
-from protlake.read import cif_to_bcif_bytes, cif_bytes_to_bcif_bytes
+from protlake.utils import ensure_dirs, get_protlake_dirs, cif_to_bcif_bytes, cif_bytes_to_bcif_bytes
 
 # --------------- Arrow schemas ---------------
 list_f32 = pa.list_(pa.float32())
