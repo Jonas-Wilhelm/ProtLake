@@ -10,7 +10,7 @@ def deltatable_maintenance(dt, target_size = 1 << 28, max_concurrent_tasks=2):
     dt.optimize.z_order(["name"], target_size=target_size, max_concurrent_tasks=max_concurrent_tasks) # ~256 MB per file
     # if too slow, just do compact instread of z_order, idea is to keep the names together
     # dt.optimize.compact(target_size=target_size, max_concurrent_tasks=max_concurrent_tasks)
-    dt.vacuum(retention_hours=0.1, enforce_retention_duration=False, dry_run=False)
+    dt.vacuum(retention_hours=0, enforce_retention_duration=False, dry_run=False)
     dt.cleanup_metadata()
     dt.create_checkpoint()
 

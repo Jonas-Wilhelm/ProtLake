@@ -215,4 +215,6 @@ class ProtLake():
         return seq_list if len(seq_list) > 1 else seq_list[0]
 
     def __repr__(self):
-        return f"ProtLake at {self.path} with {self.nrow:,} structures"
+        if self.n_row is None:
+            self.nrow()
+        return f"ProtLake at {self.path} with {self.n_row:,} structures"

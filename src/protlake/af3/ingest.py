@@ -437,9 +437,9 @@ class ShardPackWriter:
                             # failed to steal (race), try next
                             i += 1
                             # slight backoff
-                            time.sleep(0.05 + random.random() * 0.1)
+                            time.sleep(random.uniform(0.05, 0.5))
                             continue
-                        fd = os.open(shard, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o644)
+                        fd = os.open(shard, os.O_CREAT | os.O_RDWR, 0o644)
                         os.close(fd)
                         self._current_shard = shard
                         return shard
@@ -447,7 +447,7 @@ class ShardPackWriter:
                         # failed to steal (race); skip to next
                         i += 1
                         # slight backoff
-                        time.sleep(0.05 + random.random() * 0.1)
+                        time.sleep(random.uniform(0.05, 0.5))
                         continue
                 else:
                     # someone else owns an active claim; skip
@@ -471,9 +471,9 @@ class ShardPackWriter:
                         # lost race creating claim, try next
                         i += 1
                         # slight backoff
-                        time.sleep(0.05 + random.random() * 0.1)
+                        time.sleep(random.uniform(0.05, 0.5))
                         continue
-                    fd = os.open(shard, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o644)
+                    fd = os.open(shard, os.O_CREAT | os.O_RDWR, 0o644)
                     os.close(fd)
                     self._current_shard = shard
                     return shard
@@ -481,7 +481,7 @@ class ShardPackWriter:
                     # lost race creating claim, try next
                     i += 1
                     # slight backoff
-                    time.sleep(0.05 + random.random() * 0.1)
+                    time.sleep(random.uniform(0.05, 0.5))
                     continue
 
             # shard exists and is full -> next
