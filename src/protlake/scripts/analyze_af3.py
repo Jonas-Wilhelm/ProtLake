@@ -29,6 +29,8 @@ def main():
     parser.add_argument("--merge-only", action="store_true",
                         help="if set, only the merge operation will be performed. \
                         Expects a complete staging table at --staging-path")
+    parser.add_argument("--slurm-time", type=str, default="04:00:00",
+                        help="Time limit for SLURM jobs (format HH:MM:SS)")
 
     # `parse_known_args` lets us grab the rest (worker args) without erroring
     launcher_args, worker_args = parser.parse_known_args()
@@ -60,12 +62,12 @@ def main():
             f"sbatch",
             f"--cpus-per-task=1",
             f"--array=0-{launcher_args.num_tasks-1}",
-            f"--time=04:00:00",
+            f"--time={launcher_args.slurm_time}",
             f"--mem=8G",
             f"--partition=cpu",
             f"--job-name=protlake_af3_analysis_worker",
-            f"--output={launcher_args.log_dir}/worker_%A_%a.out",
-            f"--error={launcher_args.log_dir}/worker_%A_%a.out",
+            f"--output={launcher_args.log_dir}/worker_%A_%a.log",
+            f"--error={launcher_args.log_dir}/worker_%A_%a.log",
             f"--parsable",
             f"--wrap", wrap_cmd
         ]
@@ -102,12 +104,12 @@ def main():
     merge_cmd = [
         f"sbatch",
         f"--cpus-per-task=1",
-        f"--time=04:00:00",
+        f"--time={launcher_args.slurm_time}",
         f"--mem=8G",
         f"--partition=cpu",
         f"--job-name=protlake_af3_analysis_merge",
-        f"--output={launcher_args.log_dir}/merge_%A.out",
-        f"--error={launcher_args.log_dir}/merge_%A.out",
+        f"--output={launcher_args.log_dir}/merge_%A.log",
+        f"--error={launcher_args.log_dir}/merge_%A.log",
         f"--parsable",
         "--wrap", merge_wrap_cmd
     ]
