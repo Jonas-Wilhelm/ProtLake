@@ -6,6 +6,17 @@ import subprocess
 from deltalake import DeltaTable
 from protlake.utils import get_protlake_dirs
 import argparse
+import tempfile
+
+def quote_args(args):
+    '''Quote arguments for safe shell usage.'''
+    out = []
+    for a in args:
+        if a.startswith("-"):
+            out.append(a)
+        else:
+            out.append(f'"{a}"')
+    return out
 
 def main():
     parser = argparse.ArgumentParser()
@@ -31,14 +42,26 @@ def main():
                         Expects a complete staging table at --staging-path")
     parser.add_argument("--slurm-time", type=str, default="04:00:00",
                         help="Time limit for SLURM jobs (format HH:MM:SS)")
+    parser.add_argument("--python-bin", type=str, default="python",
+                        help="Python binary to use in SLURM jobs")
 
     # `parse_known_args` lets us grab the rest (worker args) without erroring
     launcher_args, worker_args = parser.parse_known_args()
+    # somehow this is necessary to avoid issues with sbatch wrapping?
+    # worker_args = quote_args(worker_args)
+    # print("Worker args:", worker_args)
 
     if launcher_args.staging_path:
         staging_path = launcher_args.staging_path
     else:
         staging_path = os.path.join(launcher_args.protlake_path, "delta_staging_table")
+    
+    # Create log and staging directories if they don't exist
+    if not os.path.exists(launcher_args.log_dir):
+        os.makedirs(launcher_args.log_dir)
+    
+    if not os.path.exists(staging_path):
+        os.makedirs(staging_path)
 
     worker_script = "protlake.af3.analysis_worker"
     merge_script = "protlake.af3.analysis_merge"
@@ -51,41 +74,52 @@ def main():
     # Submit array job
     # Flatten the tuple for --wrap into a single string
     if not launcher_args.merge_only:
-        wrap_cmd = (
-            f"python -m {worker_script} {' '.join(shlex.quote(a) for a in worker_args)} "
+        worker_cmd = (
+            f"{launcher_args.python_bin} -m {worker_script} {' '.join(shlex.quote(a) for a in worker_args)} "
             f"--protlake-path {launcher_args.protlake_path} "
             f"--staging-path {staging_path} "
             f"--snapshot-ver {snapshot_ver} "
         )
 
-        sbatch_cmd = [
-            f"sbatch",
-            f"--cpus-per-task=1",
-            f"--array=0-{launcher_args.num_tasks-1}",
-            f"--time={launcher_args.slurm_time}",
-            f"--mem=8G",
-            f"--partition=cpu",
-            f"--job-name=protlake_af3_analysis_worker",
-            f"--output={launcher_args.log_dir}/worker_%A_%a.log",
-            f"--error={launcher_args.log_dir}/worker_%A_%a.log",
-            f"--parsable",
-            f"--wrap", wrap_cmd
+        sbatch_file = [
+            f"#!/bin/bash",
+            f"#SBATCH --job-name=protlake_af3_analysis_worker",
+            f"#SBATCH --cpus-per-task=1",
+            f"#SBATCH --array=0-{launcher_args.num_tasks-1}",
+            f"#SBATCH --time={launcher_args.slurm_time}",
+            f"#SBATCH --mem=8G",
+            f"#SBATCH --partition=cpu",
+            f"#SBATCH --output={launcher_args.log_dir}/worker_%A_%a.log",
+            f"#SBATCH --error={launcher_args.log_dir}/worker_%A_%a.log",
+            f"#SBATCH --parsable",
+            f"",
+            f"{worker_cmd}"
         ]
 
         if launcher_args.local:
             print("Running in local mode, executing worker script directly")
-            print("Executing command:\n", wrap_cmd)
+            print("Executing command:\n", worker_cmd)
             if launcher_args.dry_run:
                 print("Dry run mode, not executing command")
             else:
-                subprocess.run(shlex.split(wrap_cmd), check=True)
+                subprocess.run(shlex.split(worker_cmd), check=True)
         else:
-            print("Submitting array job with command:\n", " ".join(sbatch_cmd))
+            print(
+                "Submitting array job with sbatch script:\n",
+                "--------------------------------\n",
+                "\n".join([f"    {line}" for line in sbatch_file]),
+                "\n--------------------------------\n"
+                )
             if launcher_args.dry_run:
                 print("Dry run mode, not submitting job")
             else:
+                with tempfile.NamedTemporaryFile(mode="w", delete=False) as tmpfile:
+                    tmpfile.write("\n".join(sbatch_file))
+                    tmpfile_path = tmpfile.name
+                sbatch_cmd = ["sbatch", tmpfile_path]
                 job_id = subprocess.check_output(sbatch_cmd, text=True).strip()
                 print(f"Submitted array job {job_id}")
+                os.remove(tmpfile_path)
 
     # Submit follow-up job to merge results
     if launcher_args.dont_merge:
@@ -93,9 +127,9 @@ def main():
         return
     
     merge_wrap_cmd = (
-        f"python -m {merge_script} "
-        f"--protlake-path {launcher_args.protlake_path} "
-        f"--staging-path {staging_path} "
+        f'{launcher_args.python_bin} -m {merge_script} '
+        f'--protlake-path {launcher_args.protlake_path} '
+        f'--staging-path {staging_path} '
     )
 
     if launcher_args.dont_delete_staging_table:
@@ -111,7 +145,7 @@ def main():
         f"--output={launcher_args.log_dir}/merge_%A.log",
         f"--error={launcher_args.log_dir}/merge_%A.log",
         f"--parsable",
-        "--wrap", merge_wrap_cmd
+        "--wrap", shlex.quote(merge_wrap_cmd)
     ]
 
     if not launcher_args.merge_only:
