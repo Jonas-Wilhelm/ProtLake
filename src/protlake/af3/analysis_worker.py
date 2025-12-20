@@ -137,7 +137,7 @@ class staging_col_dict:
 
 def replace_ligand_atom_names(replacement_string, aa_af3):
     for spec in replacement_string:
-        resname_pair, atom_string = spec.split("$")
+        resname_pair, atom_string = spec.split("=")
         resname_pair = tuple(resname_pair.split(":"))
         atom_pairs = [tuple(s.split(":")) for s in atom_string.split(",")]
         res_mask = (aa_af3.res_name == resname_pair[0])
@@ -163,7 +163,7 @@ def main():
     parser.add_argument("--snapshot-ver", type=int, required=True, help="DeltaLake snapshot version to use")
     parser.add_argument("--staging-path", type=str, required=True, help="Path to the staging directory, default: <protlake-path>/delta_staging_table")
     parser.add_argument("--design-dir", type=str, required=True, help="Path to the design directory")
-    parser.add_argument("--replace_lig_atom_names", type=str, nargs="+", help="Residue names and atom names to replace in the AF3 output, example: LIG_B:FE1$FE:FE")
+    parser.add_argument("--replace_lig_atom_names", type=str, nargs="+", help="Residue names and atom names to replace in the AF3 output, example: LIG_B:FE1=FE:FE")
 
     # parse arguments
     args = parser.parse_args(remaining_argv)
@@ -236,7 +236,12 @@ def main():
                 # ------------ import structure and meta data ------------
                 meta = batch.slice(row, 1).to_pylist()[0]
                 
-                aa_af3 = pread_bcif_to_atom_array(os.path.join(shard_dir, meta["bcif_shard"]), meta["bcif_data_off"], meta["bcif_len"])
+                try:
+                    aa_af3 = pread_bcif_to_atom_array(os.path.join(shard_dir, meta["bcif_shard"]), meta["bcif_data_off"], meta["bcif_len"])
+                except Exception as e:
+                    print(f"Error reading AF3 structure for {name}, sample {meta['sample']}, seed {meta['seed']}: {e}")
+                    continue
+                
                 if not OXT_present_design:
                     # remove OXT if not present in design
                     OXT_mask = (aa_af3.atom_name == "OXT") & ~aa_af3.hetero
@@ -254,7 +259,11 @@ def main():
 
                 aa_af3, _ = superimpose(aa_design, aa_af3, atom_mask=CA_mask)
                 
-                confidences = pread_json_msgpack_to_dict(os.path.join(shard_dir, meta["json_shard"]), meta["json_data_off"], meta["json_len"])
+                try:
+                    confidences = pread_json_msgpack_to_dict(os.path.join(shard_dir, meta["json_shard"]), meta["json_data_off"], meta["json_len"])
+                except Exception as e:
+                    print(f"Error reading confidences for {name}, sample {meta['sample']}, seed {meta['seed']}: {e}")
+                    continue
                 # convert lists to numpy arrays
                 confidences = {
                     k: np.asarray(v) if isinstance(v, list) and all(isinstance(x, (int, float, list, str)) for x in v) else v for k, v in confidences.items()
