@@ -879,6 +879,7 @@ class AF3ProtlakeWriter:
 
     def get_existing_outputs(self, expected_outputs: List[Tuple[str, Tuple[int], Tuple[int]]]) -> set[str]:
         """Given a list of (name, seeds, sample_idx) tuples, return the names that have complete outputs."""
+        # TODO add option to delete incomplete entries
         if not DeltaTable.is_deltatable(f"file://{os.path.abspath(self.delta_path)}"):
             raise RuntimeError("Delta table does not exist yet. Create (empty) protlake first.")
 
@@ -919,13 +920,13 @@ class AF3ProtlakeWriter:
 
         existing_names = set()
         for name, target_set in targets.items():
-            if found[name] == target_set:
+            if found[name] == target_set: # complete
                 print(f"Name={name}: all {len(target_set)} entries found.")
                 existing_names.add(name)
-            else:
-                if not found[name]:
+            else: # incomplete
+                if not found[name]: # none found
                     print(f"Name={name}: no entries found.")
-                else:
+                else: # partial found
                     missing = sorted(target_set - found[name])
                     print(f"Name={name}: only {len(found[name])}/{len(target_set)} entries found. Missing: {missing}")
 
