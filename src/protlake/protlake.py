@@ -208,6 +208,7 @@ class ProtLake():
                 seq_list.append(str(seqs[0]))
             except Exception as e:
                 print(f"Error reading {shard_path} at offset {offset} with length {length}: {e}")
+                seq_list.append(None)
                 continue
 
         return seq_list if len(seq_list) > 1 else seq_list[0]
