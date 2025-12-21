@@ -293,15 +293,18 @@ def main():
                     pLDDT_SC_around_lig = np.mean(confidences["atom_plddts"][sc_close_to_het_mask], dtype=np.float32)
                     staging_columns.append("pLDDT_SC_around_lig", pLDDT_SC_around_lig)
 
-                    RMSD_SC_around_lig = rmsd_sc_automorphic(aa_design[sc_close_to_het_mask], aa_af3[sc_close_to_het_mask])
+                    # before calculating RMSD_SC_around_lig, we align on that region
+                    aa_af3_temp, _ = superimpose(aa_design, aa_af3, atom_mask=(sc_close_to_het_mask & CA_mask))
+                    RMSD_SC_around_lig = rmsd_sc_automorphic(aa_design[sc_close_to_het_mask], aa_af3_temp[sc_close_to_het_mask])
                     staging_columns.append("RMSD_SC_around_lig", RMSD_SC_around_lig)
+                    del aa_af3_temp
 
                     pLDDT_LIGs = {k: np.mean(confidences["atom_plddts"][aa_af3.res_name == k], dtype=np.float32) for k in np.unique(aa_af3[aa_af3.hetero].res_name)}
                     for key, val in pLDDT_LIGs.items():
                         staging_columns.append(f"pLDDT_LIG_{key}", val)
                 
-
                 # ------------ calculate user defiend metrics ------------
+                # TODO: pass one input object instead of separate arguments
                 eval_scorefxns(scorefxns, aa_design, aa_af3, meta, confidences, sc_close_to_het_mask, args, staging_columns)
 
         end_time = time.time()
