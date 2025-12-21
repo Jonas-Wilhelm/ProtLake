@@ -134,9 +134,16 @@ class staging_col_dict:
     
     def __repr__(self):
         return repr(self.main_dict)
+    
 
-def replace_ligand_atom_names(replacement_string, aa_af3):
-    for spec in replacement_string:
+def replace_ligand_res_names(replacement_strings, aa_af3):
+    for spec in replacement_strings:
+        old_resname, new_resname = spec.split("=")
+        aa_af3.res_name[aa_af3.res_name == old_resname] = new_resname
+
+
+def replace_ligand_atom_names(replacement_strings, aa_af3):
+    for spec in replacement_strings:
         resname_pair, atom_string = spec.split("=")
         resname_pair = tuple(resname_pair.split(":"))
         atom_pairs = [tuple(s.split(":")) for s in atom_string.split(",")]
@@ -151,7 +158,9 @@ def main():
     default_scorefxn_dir = Path(protlake.__file__).resolve().parent / "af3" / "scorefxns"
     bootstrap_parser = argparse.ArgumentParser()
     bootstrap_parser.add_argument("--custom-scorefxn-dir", default=default_scorefxn_dir, help="Directory with score function plugins. default: protlake/af3/scorefxns")
-    bootstrap_parser.add_argument("--scorefxns", type=str, nargs="+", default=None, help="Names of score functions to run (default: all in --custom-scorefxn-dir)")
+    bootstrap_parser.add_argument("--scorefxns", type=str, nargs="+", default=None, 
+                                  help="Names of score functions to run. " \
+                                    "Default: all in --custom-scorefxn-dir")
     boot_args, remaining_argv = bootstrap_parser.parse_known_args()
 
     # main parser and load score functions
@@ -163,7 +172,13 @@ def main():
     parser.add_argument("--snapshot-ver", type=int, required=True, help="DeltaLake snapshot version to use")
     parser.add_argument("--staging-path", type=str, required=True, help="Path to the staging directory, default: <protlake-path>/delta_staging_table")
     parser.add_argument("--design-dir", type=str, required=True, help="Path to the design directory")
-    parser.add_argument("--replace_lig_atom_names", type=str, nargs="+", help="Residue names and atom names to replace in the AF3 output, example: LIG_B:FE1=FE:FE")
+    parser.add_argument("--replace_lig_res_names", type=str, required=False, nargs="+", 
+                        help="Residue names to replace in the AF3 output. " \
+                             "Format: OLD_RESNAME1=NEW_RESNAME1 OLD_RESNAME2=NEW_RESNAME2")
+    parser.add_argument("--replace_lig_atom_names", type=str, required=False, nargs="+", 
+                        help="Similar to --replace_lig_res_names but also enables atom name replacements. " \
+                            "Format:  OLD_RESNAME1:NEW_RESNAME1=OLD_ATOM1:NEW_ATOM1,OLD_ATOM2:NEW_ATOM2. " \
+                            "Example: LIG_B:LIG=C1:C5,C2:C6")
 
     # parse arguments
     args = parser.parse_args(remaining_argv)
@@ -171,6 +186,11 @@ def main():
     snapshot_ver = args.snapshot_ver
     design_dir = args.design_dir
     staging_path = args.staging_path
+    replace_lig_res_names = args.replace_lig_res_names
+    replace_lig_atom_names = args.replace_lig_atom_names
+
+    if replace_lig_res_names is not None and replace_lig_atom_names is not None:
+        raise ValueError("Cannot use both --replace_lig_res_names and --replace_lig_atom_names at the same time")
 
     # get slurm environment variables, if not present assume local mode and set to single task
     if 'SLURM_ARRAY_TASK_COUNT' not in os.environ or 'SLURM_ARRAY_TASK_ID' not in os.environ:
@@ -254,8 +274,11 @@ def main():
                     print(f"Warning: Missmatch of atom names in in design model and af3 prediction for {name}, sample {meta['sample']}, seed {meta['seed']}")
                     continue
 
-                if args.replace_lig_atom_names is not None:
-                    replace_ligand_atom_names(args.replace_lig_atom_names, aa_af3)
+                if replace_lig_res_names is not None:
+                    replace_ligand_res_names(replace_lig_res_names, aa_af3)
+
+                if replace_lig_atom_names is not None:
+                    replace_ligand_atom_names(replace_lig_atom_names, aa_af3)
 
                 aa_af3, _ = superimpose(aa_design, aa_af3, atom_mask=CA_mask)
                 
