@@ -1,7 +1,7 @@
 import numpy as np
 
 scorefxn_name = "lig_atom_dist"
-description = "<>"
+description = "Calculates distances between specified ligand atom pairs. Supports multiple ligands."
 
 def score(aa_design, aa_af3, meta, confidences, sc_close_to_het_mask, CLI_args):
     

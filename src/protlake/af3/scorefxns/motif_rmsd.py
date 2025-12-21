@@ -3,7 +3,7 @@ from protlake.utils import rmsd_sc_automorphic
 from biotite.structure import rmsd, superimpose
 
 scorefxn_name = "motif_rmsd"
-description = "optional description"
+description = "Calculates RMSD over specified motif residues between designed structure and AF3 prediction. Supports optional superimposition on motif residues."
 
 def _expand_contig(contig_str):
     """
