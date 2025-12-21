@@ -3,7 +3,7 @@ import itertools
 from biotite.structure import rmsd
 
 scorefxn_name = "lig_rmsd"
-description = "<>"
+description = "Calculates ligand RMSD between designed structure and AF3 prediction. Supports multiple ligands and chemically equivalent atoms."
 
 def _resname_mask(aa, res_name):
     return (aa.res_name == res_name).astype(bool)
@@ -26,8 +26,8 @@ def _unique_chain_resi_pairs(aa):
 def _update_best_rmsd(current_best, reference, subject):
     r = rmsd(reference, subject)
     if np.isnan(current_best) or r < current_best:
-        return r
-    return current_best
+        return r, True
+    return current_best, False
 
 def score(aa_design, aa_af3, meta, confidences, sc_close_to_het_mask, CLI_args):
 
@@ -53,14 +53,14 @@ def score(aa_design, aa_af3, meta, confidences, sc_close_to_het_mask, CLI_args):
         resname_af3, resname_design = key.split(":")
         af3_rsmd_atoms = _select_and_sort_aa(aa_af3, resname_af3, atom_names)
         if af3_rsmd_atoms.shape[0] == 0:
-            print(f"Warning: no atoms found for {resname_af3} in af3 model {meta['name']}, sample {meta['sample']}, seed {meta['seed']}")
+            print(f"Warning (lig_rmsd): no atoms found for {resname_af3} in af3 model {meta['name']}, sample {meta['sample']}, seed {meta['seed']}")
             continue
         af3_chain_resi_pairs = _unique_chain_resi_pairs(af3_rsmd_atoms)
 
 
         design_rsmd_atoms = _select_and_sort_aa(aa_design, resname_design, atom_names)
         if design_rsmd_atoms.shape[0] == 0:
-            print(f"Warning: no atoms found for {resname_design} in design model {meta['name']}, sample {meta['sample']}, seed {meta['seed']}")
+            print(f"Warning (lig_rmsd): no atoms found for {resname_design} in design model {meta['name']}, sample {meta['sample']}, seed {meta['seed']}")
             continue
         design_chain_resi_pairs = _unique_chain_resi_pairs(design_rsmd_atoms)
 
@@ -72,22 +72,49 @@ def score(aa_design, aa_af3, meta, confidences, sc_close_to_het_mask, CLI_args):
 
             mask_design = _chain_resi_mask(design_rsmd_atoms, design_lig[0] ,design_lig[1])
             mask_af3 = _chain_resi_mask(af3_rsmd_atoms, af3_lig[0] ,af3_lig[1])
-            if np.sum(mask_design) != np.sum(mask_af3):
-                print(f"Warning: different number of atoms for design {design_lig} ({np.sum(mask_design)}) and af3 {af3_lig} ({np.sum(mask_af3)}) in model {meta['name']}, sample {meta['sample']}, seed {meta['seed']}")
-                continue
-            design_sel = design_rsmd_atoms[mask_design].copy() # copy might not be needed, but to be sure changing positions does not affect anything else
-            af3_sel = af3_rsmd_atoms[mask_af3].copy()
-            lig_rmsd = _update_best_rmsd(lig_rmsd, design_sel, af3_sel)
+            design_sel = design_rsmd_atoms[mask_design]
+            af3_sel = af3_rsmd_atoms[mask_af3]
+            design_names = design_sel.atom_name
+            af3_names = af3_sel.atom_name
+            # check if both selections have the same atoms
+            if not np.array_equal(np.sort(design_names), np.sort(af3_names)):
+                if CLI_args.lig_rmsd_allow_partial_matches:
+                    common = np.intersect1d(design_names, af3_names)
+                    if common.shape[0] == 0:
+                        print(f"Warning (lig_rmsd): no common atoms found for design {design_lig} and af3 {af3_lig} in model {meta['name']}, sample {meta['sample']}, seed {meta['seed']}")
+                        continue
+                    design_sel = design_sel[np.isin(design_sel.atom_name, common)]
+                    af3_sel = af3_sel[np.isin(af3_sel.atom_name, common)]
+                    if not np.array_equal(design_sel.atom_name, af3_sel.atom_name):
+                        print(f"Warning (lig_rmsd): atom order mismatch after matching for design {design_lig} and af3 {af3_lig} in model {meta['name']}, sample {meta['sample']}, seed {meta['seed']}")
+                        continue
+                    print(f"Info (lig_rmsd): partial atom match for design {design_lig} ({design_names}) and af3 {af3_lig} ({af3_names}) in model {meta['name']}, sample {meta['sample']}, seed {meta['seed']}. Using common atoms: {common}")
+                else:
+                    print(f"Warning (lig_rmsd): different atom sets for design {design_lig} ({design_names}) and af3 {af3_lig} ({af3_names}) in model {meta['name']}, sample {meta['sample']}, seed {meta['seed']}")
+                    print("  To allow partial matches, enable --lig_rmsd_allow_partial_matches")
+                    continue
+            
+            design_sel_c = design_sel.copy() # copy might not be needed, but to be sure changing positions does not affect anything else
+            af3_sel_c = af3_sel.copy()
+            lig_rmsd_curr_permut = np.nan
+            lig_rmsd_curr_permut, _ = _update_best_rmsd(lig_rmsd_curr_permut, design_sel_c, af3_sel_c)
             if key in chem_eq_atoms:
-                # flip that eqivalent atoms and see if rmsd improves
-                for tuple in chem_eq_atoms[key]:
+                # flip equivalent atoms and see if rmsd improves
+                for a, b in chem_eq_atoms[key]:
                     # switch positions of atoms 
-                    i, j = np.where(af3_sel.atom_name == tuple[0])[0][0], \
-                           np.where(af3_sel.atom_name == tuple[1])[0][0]
-                    tmp = af3_sel[i].copy()     # make a copy of atom i
-                    af3_sel[i] = af3_sel[j]     # assign atom j into position i
-                    af3_sel[j] = tmp            # put original i into j
-                lig_rmsd = _update_best_rmsd(lig_rmsd, design_sel, af3_sel)
+                    i, j = np.where(af3_sel_c.atom_name == a)[0][0], \
+                           np.where(af3_sel_c.atom_name == b)[0][0]
+                    tmp_i = af3_sel_c[i].copy()     # make a copy of atom i
+                    af3_sel_c[i] = af3_sel_c[j]     # assign atom j into position i
+                    af3_sel_c[j] = tmp_i            # put original i into j
+                    lig_rmsd_curr_permut, improved = _update_best_rmsd(lig_rmsd_curr_permut, design_sel_c, af3_sel_c) 
+                    if improved: # keep the swapped version if it improved
+                        continue  
+                    else: # swap back
+                        af3_sel_c[j] = af3_sel_c[i] # put swapped i back into j
+                        af3_sel_c[i] = tmp_i        # put original i back into i
+
+            lig_rmsd, _ = _update_best_rmsd(lig_rmsd, design_sel_c, af3_sel_c)
 
         LIG_rmsds[f"RMSD_lig_{key}"] = lig_rmsd
 
@@ -96,8 +123,11 @@ def score(aa_design, aa_af3, meta, confidences, sc_close_to_het_mask, CLI_args):
 def register_args(parser):
     parser.add_argument("--atom_names_rmsd", type=str, required=False, nargs='+',
                         help="Names of ligand atoms (in the design structure) that should be used for ligand rmsd calculation \
-                              Format: AF3_LIG:DESIGN_LIG-ATOM1:ATOM2:...")
+                              Format: AF3_LIG:DESIGN_LIG$ATOM1:ATOM2:...")
     parser.add_argument("--chem_eq_atoms", type=str, required=False, nargs='+',
                         help="Chemically equivalent atom pairs to account for when calculating ligand RMSDs. \
                               (e.g. the non-substituted C atoms in para-hydroxybenzoic acid) \
-                              Format: AF3_LIG:DESIGN_LIG-ATOM1:ATOM2_ATOM3:ATOM4-ATOM5:ATOM6...")
+                              Format: AF3_LIG:DESIGN_LIG$ATOM1:ATOM2_ATOM3:ATOM4_ATOM5:ATOM6...")
+    parser.add_argument("--lig_rmsd_allow_partial_matches", action="store_true",
+                        help="If set, ligands with missing atoms in the af3 structure will still be considered for RMSD calculation. \
+                              The RMSD will then be calculated over the available atoms only.")
