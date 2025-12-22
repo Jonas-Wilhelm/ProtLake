@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import os
+import re
 import shlex
 import subprocess
 from deltalake import DeltaTable
@@ -25,13 +26,15 @@ def main():
                         help="Number of workers in the array")
     parser.add_argument("--protlake-path", type=str, required=True, 
                         help="Path to the Protlake directory to analyze")
+    parser.add_argument("--design-dir", type=str, required=True, 
+                        help="Path to the design directory")
     parser.add_argument("--staging-path", type=str, required=False,
                         help="Path to the staging deltatable, default: <protlake-path>/delta_staging_table")
     parser.add_argument("--local", action="store_true", 
                         help="Run in local mode (no SLURM, single task)")
     parser.add_argument("--dry-run", action="store_true",
                         help="If set, the commands will be printed but not executed")
-    parser.add_argument("--log-dir", type=str, default="log_slurm",
+    parser.add_argument("--log-dir", type=str, default="log_slurm", # TODO: consider removing default and send output to /dev/null
                         help="Directory to write SLURM log files to")
     parser.add_argument("--dont-delete-staging-table", action="store_true", 
                         help="if set, the staging-path directory will not be deleted after merging")
@@ -44,6 +47,8 @@ def main():
                         help="Time limit for SLURM jobs (format HH:MM:SS)")
     parser.add_argument("--python-bin", type=str, default="python",
                         help="Python binary to use in SLURM jobs")
+    parser.add_argument("--ncaa", type=str, nargs='+', required=False,
+                        help="List of NCAA 3-letter CCD codes.")
 
     # `parse_known_args` lets us grab the rest (worker args) without erroring
     launcher_args, worker_args = parser.parse_known_args()
@@ -77,9 +82,14 @@ def main():
         worker_cmd = (
             f"{launcher_args.python_bin} -m {worker_script} {' '.join(shlex.quote(a) for a in worker_args)} "
             f"--protlake-path {launcher_args.protlake_path} "
+            f"--design-dir {launcher_args.design_dir} "
             f"--staging-path {staging_path} "
             f"--snapshot-ver {snapshot_ver} "
         )
+
+        if launcher_args.ncaa:
+            ncaa_args = " ".join(f"--ncaa {code}" for code in launcher_args.ncaa)
+            worker_cmd += f" {ncaa_args}"
 
         sbatch_file = [
             f"#!/bin/bash",

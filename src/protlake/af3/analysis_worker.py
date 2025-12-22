@@ -1,6 +1,6 @@
 #!/usr/bin/env -S PYTHONUNBUFFERED=1 python
 
-import os, time
+import os, time, sys
 from deltalake import DeltaTable, write_deltalake
 import pyarrow as pa
 import pyarrow.compute as pc
@@ -106,6 +106,10 @@ def _expand_mask_to_residues(mask, aa):
     return np.isin(keys, sel_keys)
 
 def _filter_atoms_close_to_hetero(aa, dist = 7.5):
+    """
+    Return a boolean mask selecting all non-hetero atoms that are within `dist` Angstroms
+    of any hetero atom.
+    """
     if not np.any(aa.hetero):
         return np.zeros(aa.shape[0], dtype=bool)
     
@@ -172,6 +176,7 @@ def main():
     parser.add_argument("--snapshot-ver", type=int, required=True, help="DeltaLake snapshot version to use")
     parser.add_argument("--staging-path", type=str, required=True, help="Path to the staging directory, default: <protlake-path>/delta_staging_table")
     parser.add_argument("--design-dir", type=str, required=True, help="Path to the design directory")
+    parser.add_argument("--ncaa", type=str, nargs='+', required=False, help="List of NCAA 3-letter CCD codes.")
     parser.add_argument("--replace_lig_res_names", type=str, required=False, nargs="+", 
                         help="Residue names to replace in the AF3 output. " \
                              "Format: OLD_RESNAME1=NEW_RESNAME1 OLD_RESNAME2=NEW_RESNAME2")
@@ -242,35 +247,48 @@ def main():
             aa_design = load_structure(design_path)
             # remove hydrogens which are not in af3 output anyway
             aa_design = aa_design[aa_design.element != "H"]
-            aa_design = _standardize_order_not_hetero(aa_design)
+            # if ncaa specified, set those residues to non-hetero
+            if args.ncaa:
+                for resn in args.ncaa:
+                    aa_design.hetero[aa_design.res_name == resn] = False
+
+            aa_design = _standardize_order_not_hetero(aa_design) # TODO also do for af3 output?
+            OXT_present_design = np.any(aa_design.atom_name == "OXT")
             # create bool selection masks
-            CA_mask = (~aa_design.hetero & (aa_design.atom_name == "CA"))
-            bb_mask = filter_peptide_backbone(aa_design)
+            aa_design_prot = aa_design[~aa_design.hetero]
+            CA_mask = (aa_design_prot.atom_name == "CA")
+            bb_mask = filter_peptide_backbone(aa_design_prot)
             close_to_het_mask = _expand_mask_to_residues(
                 _filter_atoms_close_to_hetero(aa_design, 7.5), 
                 aa_design
             )
-            sc_close_to_het_mask = (close_to_het_mask & ~bb_mask)
-            OXT_present_design = np.any(aa_design.atom_name == "OXT")
+            sc_close_to_het_mask = (close_to_het_mask[~aa_design.hetero] & ~bb_mask)
             for row in rows:
                 # ------------ import structure and meta data ------------
                 meta = batch.slice(row, 1).to_pylist()[0]
-                
+
                 try:
                     aa_af3 = pread_bcif_to_atom_array(os.path.join(shard_dir, meta["bcif_shard"]), meta["bcif_data_off"], meta["bcif_len"])
                 except Exception as e:
                     print(f"Error reading AF3 structure for {name}, sample {meta['sample']}, seed {meta['seed']}: {e}")
                     continue
                 
+                # if ncaa specified, set those residues to non-hetero
+                if args.ncaa:
+                    for resn in args.ncaa:
+                        aa_af3.hetero[aa_af3.res_name == resn] = False
+
+                # remove OXT from AF3 output if not present in design model
                 if not OXT_present_design:
-                    # remove OXT if not present in design
                     OXT_mask = (aa_af3.atom_name == "OXT") & ~aa_af3.hetero
-                    OXT_indexes = np.where(OXT_mask)[0]
                     aa_af3 = aa_af3[~OXT_mask]
-                if aa_af3[~aa_af3.hetero].shape[0] != aa_design[~aa_design.hetero].shape[0]:
+                
+                # check that design and af3 have same atoms in same order for non-hetero atoms
+                aa_af3_prot = aa_af3[~aa_af3.hetero]
+                if aa_af3_prot.shape[0] != aa_design_prot.shape[0]:
                     print(f"Warning: Different number of (non H) atoms in in design model and af3 prediction for {name}, sample {meta['sample']}, seed {meta['seed']}")
                     continue
-                if not np.all(aa_af3.atom_name[~aa_af3.hetero] == aa_design.atom_name[~aa_design.hetero]):
+                if not np.all(aa_af3_prot.atom_name == aa_design_prot.atom_name):
                     print(f"Warning: Missmatch of atom names in in design model and af3 prediction for {name}, sample {meta['sample']}, seed {meta['seed']}")
                     continue
 
@@ -280,7 +298,15 @@ def main():
                 if replace_lig_atom_names is not None:
                     replace_ligand_atom_names(replace_lig_atom_names, aa_af3)
 
-                aa_af3, _ = superimpose(aa_design, aa_af3, atom_mask=CA_mask)
+                # first calculate transformation to align AF3 to design based on non-hetero CA atoms
+                _, transformation = superimpose(
+                    aa_design_prot, 
+                    aa_af3_prot, 
+                    atom_mask=CA_mask
+                )
+                # apply transformation to whole AF3 structure
+                aa_af3 = transformation.apply(aa_af3)
+                aa_af3_prot = aa_af3[~aa_af3.hetero] # also update protein-only view
                 
                 try:
                     confidences = pread_json_msgpack_to_dict(os.path.join(shard_dir, meta["json_shard"]), meta["json_data_off"], meta["json_len"])
@@ -300,28 +326,28 @@ def main():
                 # ------------ calculate base metrics ------------
                 staging_columns.append("id_hex", meta["id_hex"], pa.string())
 
-                pLDDT_CA = np.mean(confidences["atom_plddts"][bb_mask], dtype=np.float32)
+                pLDDT_CA = np.mean(confidences["atom_plddts"][aa_af3.atom_name == "CA"], dtype=np.float32)
                 staging_columns.append("pLDDT_CA", pLDDT_CA)
 
                 pLDDT_AA = np.mean(confidences["atom_plddts"], dtype=np.float32)
                 staging_columns.append("pLDDT_AA", pLDDT_AA)
                 
-                RMSD_CA = rmsd(aa_design[CA_mask], aa_af3[CA_mask])
+                RMSD_CA = rmsd(aa_design_prot[CA_mask], aa_af3_prot[CA_mask])
                 staging_columns.append("RMSD_CA", RMSD_CA)
 
-                RMSD_AA = rmsd_sc_automorphic(aa_design[~aa_design.hetero], aa_af3[~aa_af3.hetero])
+                RMSD_AA = rmsd_sc_automorphic(aa_design_prot, aa_af3_prot)
                 staging_columns.append("RMSD_AA", RMSD_AA)
 
                 if any(aa_af3.hetero):
-                    pLDDT_SC_around_lig = np.mean(confidences["atom_plddts"][sc_close_to_het_mask], dtype=np.float32)
+                    pLDDT_SC_around_lig = np.mean(confidences["atom_plddts"][~aa_af3.hetero][sc_close_to_het_mask], dtype=np.float32)
                     staging_columns.append("pLDDT_SC_around_lig", pLDDT_SC_around_lig)
-
+                    
                     # before calculating RMSD_SC_around_lig, we align on that region
-                    aa_af3_temp, _ = superimpose(aa_design, aa_af3, atom_mask=(sc_close_to_het_mask & CA_mask))
-                    RMSD_SC_around_lig = rmsd_sc_automorphic(aa_design[sc_close_to_het_mask], aa_af3_temp[sc_close_to_het_mask])
+                    aa_af3_temp, _ = superimpose(aa_design_prot, aa_af3_prot, atom_mask=sc_close_to_het_mask)
+                    RMSD_SC_around_lig = rmsd_sc_automorphic(aa_design_prot[sc_close_to_het_mask], aa_af3_temp[~aa_af3_temp.hetero][sc_close_to_het_mask])
                     staging_columns.append("RMSD_SC_around_lig", RMSD_SC_around_lig)
                     del aa_af3_temp
-
+                    
                     pLDDT_LIGs = {k: np.mean(confidences["atom_plddts"][aa_af3.res_name == k], dtype=np.float32) for k in np.unique(aa_af3[aa_af3.hetero].res_name)}
                     for key, val in pLDDT_LIGs.items():
                         staging_columns.append(f"pLDDT_LIG_{key}", val)
