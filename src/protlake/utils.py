@@ -54,15 +54,23 @@ def _sq_euclidian(reference, subject):
         raise TypeError(
             "Expected an AtomArray or an ndarray with shape (n,3) as reference"
         )
+
+    if subject_coord.shape != reference_coord.shape:
+        raise ValueError(
+            "The reference and subject must have the same shape."
+        )
+    
     dif = subject_coord - reference_coord
     return vector_dot(dif, dif)
 
 def rmsd_sc_automorphic(reference, subject):
     """
-    Compute the per-residue all-atom RMSD between two structures, accounting for
-    symmetry in selected sidechain atoms (e.g., OD1/OD2 in ASP). Returns the overall 
-    RMSD across all residues.
+    Compute the all-atom RMSD between two structures, accounting for
+    symmetry in selected sidechain atoms (e.g., OD1/OD2 in ASP).
     """
+    if not np.array_equal(reference.atom_name, subject.atom_name):
+        raise ValueError("The reference and subject must have the same atom ordering.")
+
     # TODO make this work with non complete residues (e.g. only last 3 atoms of PHE)
     SYMMETRY_MAP = {
         "ASP": [("OD1","OD2")],
@@ -72,6 +80,7 @@ def rmsd_sc_automorphic(reference, subject):
         "ARG": [("NH1","NH2")],
         "LEU": [("CD1","CD2")],
         "VAL": [("CG1","CG2")],
+        "KCX": [("OQ1","OQ2")], # NCAA, lysine analog with carboxylated sidechain
     }
     chain = reference.chain_id.astype(str)
     res   = reference.res_id.astype(str)
@@ -81,29 +90,31 @@ def rmsd_sc_automorphic(reference, subject):
     groups = np.split(np.arange(reference.shape[0]), boundaries)
 
     all_sd = np.array([], dtype=np.float32)
+    all_sd = []
     for atom_idx in groups:
         res_name = reference[atom_idx[0]].res_name
         sd = _sq_euclidian(reference[atom_idx], subject[atom_idx])
-        msd = np.mean(sd, axis=-1)
-        if res_name in SYMMETRY_MAP.keys():
+        msd = np.mean(sd)
+        if res_name in SYMMETRY_MAP:
             atom_idx_swapped = atom_idx.copy()
             atom_pairs = SYMMETRY_MAP[res_name]
             for atom_pair in atom_pairs:
                 # check if both atoms in pair are present
                 if not (np.any(reference[atom_idx].atom_name == atom_pair[0]) and np.any(reference[atom_idx].atom_name == atom_pair[1])):
-                    continue
+                    raise ValueError(f"Atom pair {atom_pair} not found in residue {res_name} for symmetry consideration.")
                 # swap their indices
                 idx_a = np.where(reference[atom_idx].atom_name == atom_pair[0])[0][0]
                 idx_b = np.where(reference[atom_idx].atom_name == atom_pair[1])[0][0]
                 atom_idx_swapped[idx_a], atom_idx_swapped[idx_b] = atom_idx_swapped[idx_b], atom_idx_swapped[idx_a]
             sd_flip = _sq_euclidian(reference[atom_idx], subject[atom_idx_swapped])
-            msd_flip = np.mean(sd_flip, axis=-1)
+            msd_flip = np.mean(sd_flip)
             if msd_flip < msd:
                 sd = sd_flip
                 msd = msd_flip
-        all_sd = np.append(all_sd, sd)
+        all_sd.extend(sd)
 
-    return np.sqrt(np.mean(all_sd, axis=-1))
+    all_sd = np.array(all_sd, dtype=np.float32)
+    return np.sqrt(np.mean(all_sd))
 
 def _bcif_bytes_to_atom_array(bcif_data: bytes):
     f = io.BytesIO(bcif_data)
