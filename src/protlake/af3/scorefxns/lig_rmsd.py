@@ -1,3 +1,4 @@
+from protlake.af3.analysis_worker import ScoreFunctionInput
 import numpy as np
 import itertools
 from biotite.structure import rmsd
@@ -29,7 +30,12 @@ def _update_best_rmsd(current_best, reference, subject):
         return r, True
     return current_best, False
 
-def score(aa_design, aa_af3, meta, confidences, sc_close_to_het_mask, CLI_args):
+def score(sfx_input: ScoreFunctionInput):
+
+    aa_design = sfx_input.aa_design.copy() # copy to avoid modifying original
+    aa_af3 = sfx_input.aa_af3.copy()
+    meta = sfx_input.meta
+    CLI_args = sfx_input.CLI_args
 
     if CLI_args.atom_names_rmsd is not None:
         atom_names_rmsd = {s.split('$')[0]: np.array(s.split('$')[1].split(':'), dtype='<U6') for s in CLI_args.atom_names_rmsd}

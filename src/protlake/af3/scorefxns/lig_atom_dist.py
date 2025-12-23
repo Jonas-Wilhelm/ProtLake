@@ -1,13 +1,15 @@
+from protlake.af3.analysis_worker import ScoreFunctionInput
 import numpy as np
 
 scorefxn_name = "lig_atom_dist"
 description = "Calculates distances between specified ligand atom pairs. Supports multiple ligands."
 
-def score(aa_design, aa_af3, meta, confidences, sc_close_to_het_mask, CLI_args):
+def score(sfx_input: ScoreFunctionInput):
+    aa_af3 = sfx_input.aa_af3.copy() # copy to avoid modifying original
     
     out = {}
 
-    for ligand_atom_pair in CLI_args.ligand_atom_distances:
+    for ligand_atom_pair in sfx_input.CLI_args.ligand_atom_distances:
         left, right = ligand_atom_pair.split('_')
         lig1, atom1 = left.split(':')
         lig2, atom2 = right.split(':')

@@ -11,7 +11,7 @@ from protlake.utils import (
     pread_bcif_to_atom_array, 
     pread_json_msgpack_to_dict
 )
-from biotite.structure import filter_peptide_backbone, superimpose, rmsd
+from biotite.structure import filter_peptide_backbone, superimpose, rmsd, AtomArray
 from biotite.structure.io import load_structure, save_structure
 from biotite.structure.info import standardize_order
 from xxhash import xxh64
@@ -21,6 +21,16 @@ from pathlib import Path
 import importlib.util
 import argparse
 from pathlib import Path
+from dataclasses import dataclass
+
+@dataclass(frozen=True, slots=True)
+class ScoreFunctionInput:
+    aa_design: AtomArray
+    aa_af3: AtomArray
+    meta: dict
+    confidences: dict
+    sc_close_to_het_mask: np.ndarray
+    CLI_args: argparse.Namespace
 
 def _import_plugin_module(path: Path):
     spec = importlib.util.spec_from_file_location(path.stem, path)
@@ -41,12 +51,23 @@ def load_scorefxns(plugin_dir, parser=None, names=None):
             scorefxns.append({
                 "name": getattr(m, "scorefxn_name", m.__name__),
                 "fn": m.score,
+                "module": m,
             })
+            print(f"Loaded score function plugin: {getattr(m, 'scorefxn_name', m.__name__)}")
             # add command line options to parser if plugin contains register_args
             if parser is not None and hasattr(m, "register_args"):
                 m.register_args(parser)
+        else:
+            raise ValueError(f"Plugin module {p} does not contain a callable 'score' function")
 
     return scorefxns
+
+def execute_score_function_initializers(scorefxns, args):
+    for s in scorefxns:
+        m = s["module"]
+        if hasattr(m, "init") and callable(m.init):
+            print(f"Executing init() for plugin {s['name']}")
+            m.init(args)
 
 def _to_pa_scalar(val):
     """Map a scalar Python/NumPy value to (pa_type, python_value) or return (None, None) if unsupported."""
@@ -78,11 +99,11 @@ def _to_pa_scalar(val):
     # anything else (lists/arrays/objects) is unsupported here
     return None, None
 
-def eval_scorefxns(scorefxns, aa_design, aa_af3, meta, confidences, sc_close_to_het_mask, CLI_args, staging_columns):
+def eval_scorefxns(scorefxns, sfx_input, staging_columns):
     for s in scorefxns:
         name = s["name"]
         fn = s["fn"]
-        out = fn(aa_design, aa_af3, meta, confidences, sc_close_to_het_mask, CLI_args)
+        out = fn(sfx_input)
         if not isinstance(out, dict):
             print(f"[scorer:{name}] returned non-dict; skipping")
             continue
@@ -157,6 +178,24 @@ def replace_ligand_atom_names(replacement_strings, aa_af3):
 
         aa_af3.res_name[res_mask] = resname_pair[1]
 
+
+def af3_array_setup(aa_af3, replace_lig_res_names, replace_lig_atom_names, OXT_present_design, confidences):
+    if not OXT_present_design:
+        OXT_mask = (aa_af3.atom_name == "OXT") & ~aa_af3.hetero
+        aa_af3 = aa_af3[~OXT_mask]
+
+    if not OXT_present_design and np.any(OXT_mask):
+                    # remove OXT from confidence metrics as well
+        confidences['atom_chain_ids'] = confidences['atom_chain_ids'][~OXT_mask]
+        confidences['atom_plddts'] = confidences['atom_plddts'][~OXT_mask]
+
+    if replace_lig_res_names is not None:
+        replace_ligand_res_names(replace_lig_res_names, aa_af3)
+
+    if replace_lig_atom_names is not None:
+        replace_ligand_atom_names(replace_lig_atom_names, aa_af3)
+    return aa_af3
+
 def main():
     # bootstrap parser to parse custom score function directory
     default_scorefxn_dir = Path(protlake.__file__).resolve().parent / "af3" / "scorefxns"
@@ -187,6 +226,7 @@ def main():
 
     # parse arguments
     args = parser.parse_args(remaining_argv)
+    execute_score_function_initializers(scorefxns, args)
     main_protlake_path = args.protlake_path
     snapshot_ver = args.snapshot_ver
     design_dir = args.design_dir
@@ -267,11 +307,23 @@ def main():
                 # ------------ import structure and meta data ------------
                 meta = batch.slice(row, 1).to_pylist()[0]
 
+                # STRUCTURE
                 try:
                     aa_af3 = pread_bcif_to_atom_array(os.path.join(shard_dir, meta["bcif_shard"]), meta["bcif_data_off"], meta["bcif_len"])
                 except Exception as e:
                     print(f"Error reading AF3 structure for {name}, sample {meta['sample']}, seed {meta['seed']}: {e}")
                     continue
+
+                # CONFIDENCES
+                try:
+                    confidences = pread_json_msgpack_to_dict(os.path.join(shard_dir, meta["json_shard"]), meta["json_data_off"], meta["json_len"])
+                except Exception as e:
+                    print(f"Error reading confidences for {name}, sample {meta['sample']}, seed {meta['seed']}: {e}")
+                    continue
+                # convert lists to numpy arrays
+                confidences = {
+                    k: np.asarray(v) if isinstance(v, list) and all(isinstance(x, (int, float, list, str)) for x in v) else v for k, v in confidences.items()
+                }
                 
                 # if ncaa specified, set those residues to non-hetero
                 if args.ncaa:
@@ -279,9 +331,7 @@ def main():
                         aa_af3.hetero[aa_af3.res_name == resn] = False
 
                 # remove OXT from AF3 output if not present in design model
-                if not OXT_present_design:
-                    OXT_mask = (aa_af3.atom_name == "OXT") & ~aa_af3.hetero
-                    aa_af3 = aa_af3[~OXT_mask]
+                aa_af3 = af3_array_setup(aa_af3, replace_lig_res_names, replace_lig_atom_names, OXT_present_design, confidences)
                 
                 # check that design and af3 have same atoms in same order for non-hetero atoms
                 aa_af3_prot = aa_af3[~aa_af3.hetero]
@@ -292,13 +342,7 @@ def main():
                     print(f"Warning: Missmatch of atom names in in design model and af3 prediction for {name}, sample {meta['sample']}, seed {meta['seed']}")
                     continue
 
-                if replace_lig_res_names is not None:
-                    replace_ligand_res_names(replace_lig_res_names, aa_af3)
-
-                if replace_lig_atom_names is not None:
-                    replace_ligand_atom_names(replace_lig_atom_names, aa_af3)
-
-                # first calculate transformation to align AF3 to design based on non-hetero CA atoms
+                # first calculate transformation to align AF3 to design based on non-hetero CA atoms (to allow ligand differences)
                 _, transformation = superimpose(
                     aa_design_prot, 
                     aa_af3_prot, 
@@ -307,21 +351,6 @@ def main():
                 # apply transformation to whole AF3 structure
                 aa_af3 = transformation.apply(aa_af3)
                 aa_af3_prot = aa_af3[~aa_af3.hetero] # also update protein-only view
-                
-                try:
-                    confidences = pread_json_msgpack_to_dict(os.path.join(shard_dir, meta["json_shard"]), meta["json_data_off"], meta["json_len"])
-                except Exception as e:
-                    print(f"Error reading confidences for {name}, sample {meta['sample']}, seed {meta['seed']}: {e}")
-                    continue
-                # convert lists to numpy arrays
-                confidences = {
-                    k: np.asarray(v) if isinstance(v, list) and all(isinstance(x, (int, float, list, str)) for x in v) else v for k, v in confidences.items()
-                }
-
-                if not OXT_present_design and np.any(OXT_mask):
-                    # remove OXT from confidence metrics as well
-                    confidences['atom_chain_ids'] = confidences['atom_chain_ids'][~OXT_mask]
-                    confidences['atom_plddts'] = confidences['atom_plddts'][~OXT_mask]
 
                 # ------------ calculate base metrics ------------
                 staging_columns.append("id_hex", meta["id_hex"], pa.string())
@@ -354,7 +383,16 @@ def main():
                 
                 # ------------ calculate user defiend metrics ------------
                 # TODO: pass one input object instead of separate arguments
-                eval_scorefxns(scorefxns, aa_design, aa_af3, meta, confidences, sc_close_to_het_mask, args, staging_columns)
+                sfx_input = ScoreFunctionInput(
+                    aa_design=aa_design,
+                    aa_af3=aa_af3,
+                    meta=meta,
+                    confidences=confidences,
+                    sc_close_to_het_mask=sc_close_to_het_mask,
+                    CLI_args=args
+                )
+
+                eval_scorefxns(scorefxns, sfx_input, staging_columns)
 
         end_time = time.time()
         n_models = len(staging_columns.get_dict()['id_hex']['val'])

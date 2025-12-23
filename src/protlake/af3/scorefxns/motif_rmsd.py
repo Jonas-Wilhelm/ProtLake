@@ -1,6 +1,7 @@
 import numpy as np
 from protlake.utils import rmsd_sc_automorphic
 from biotite.structure import rmsd, superimpose
+from protlake.af3.analysis_worker import ScoreFunctionInput
 
 scorefxn_name = "motif_rmsd"
 description = "Calculates RMSD over specified motif residues between designed structure and AF3 prediction. Supports optional superimposition on motif residues."
@@ -37,7 +38,10 @@ def _expand_contig(contig_str):
             residues.add((chain_id, res_id))
     return sorted(residues, key=lambda x: (x[0], x[1]))
 
-def score(aa_design, aa_af3, meta, confidences, sc_close_to_het_mask, CLI_args):
+def score(sfx_input: ScoreFunctionInput):
+    aa_design = sfx_input.aa_design.copy() # copy to avoid modifying original
+    aa_af3 = sfx_input.aa_af3.copy()
+    CLI_args = sfx_input.CLI_args
     motif_residues = _expand_contig(CLI_args.motif_residues_contig)
 
     contig_mask = np.zeros(len(aa_design), dtype=bool)
