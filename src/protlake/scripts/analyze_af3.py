@@ -26,7 +26,7 @@ def main():
                         help="Number of workers in the array")
     parser.add_argument("--protlake-path", type=str, required=True, 
                         help="Path to the Protlake directory to analyze")
-    parser.add_argument("--design-dir", type=str, required=True, 
+    parser.add_argument("--design-dir", type=str, required=False, 
                         help="Path to the design directory")
     parser.add_argument("--staging-path", type=str, required=False,
                         help="Path to the staging deltatable, default: <protlake-path>/delta_staging_table")
@@ -79,6 +79,9 @@ def main():
     # Submit array job
     # Flatten the tuple for --wrap into a single string
     if not launcher_args.merge_only:
+        if launcher_args.design_dir is None:
+            raise ValueError("Error: --design-dir argument is required when not using --merge-only mode")
+
         worker_cmd = (
             f"{launcher_args.python_bin} -m {worker_script} {' '.join(shlex.quote(a) for a in worker_args)} "
             f"--protlake-path {launcher_args.protlake_path} "
