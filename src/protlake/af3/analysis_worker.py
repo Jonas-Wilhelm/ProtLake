@@ -405,7 +405,7 @@ def main():
             }
         )
 
-        write_deltalake(staging_path, staging_table, mode="append")
+        write_deltalake(staging_path, staging_table, mode="append", configuration={'delta.checkpointInterval': '500'})
 
 if __name__ == "__main__":
     main()
