@@ -569,7 +569,7 @@ class DeltaAppender:
         for attempt in range(1, self.retry_config.max_retries + 1):
             try:
                 # mode="append" will create table if missing
-                write_deltalake(self.table_uri, tbl, mode="append")
+                write_deltalake(self.table_uri, tbl, mode="append", configuration={'delta.checkpointInterval': '500'})
                 break  # success
             except DeltaError as e:
                 if attempt < self.retry_config.max_retries and _is_retryable_delta_error(e):
@@ -877,11 +877,15 @@ class AF3ProtlakeWriter:
 
     #     return existing_names
 
-    def get_existing_outputs(self, expected_outputs: List[Tuple[str, Tuple[int], Tuple[int]]]) -> set[str]:
+    def get_existing_outputs(self, expected_outputs: List[Tuple[str, Tuple[int], Tuple[int]]], error_on_not_exist: bool = False) -> set[str]:
         """Given a list of (name, seeds, sample_idx) tuples, return the names that have complete outputs."""
         # TODO add option to delete incomplete entries
         if not DeltaTable.is_deltatable(f"file://{os.path.abspath(self.delta_path)}"):
-            raise RuntimeError("Delta table does not exist yet. Create (empty) protlake first.")
+            if error_on_not_exist:
+                raise FileNotFoundError("Delta table does not exist yet. Create (empty) protlake first.")
+            else: # no table -> no entries found -> return empty set
+                print("Delta table does not exist yet; no entries found.")
+                return set()
 
         dt = load_delta_table_with_retries(
             delta_path = self.delta_path,
