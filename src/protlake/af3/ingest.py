@@ -561,8 +561,8 @@ class DeltaAppender:
         if not self.buf[self.schema[0].name]:
             return
         
-        if not DeltaTable.is_deltatable(self.table_uri):
-            raise FileNotFoundError(f"Delta table at {self.table_uri} does not exist. Always create before appending to make sure configuration settings are set correctly. (Concurrent writers may cause cause problems when changing configuration settings.)")
+        # if not DeltaTable.is_deltatable(self.table_uri):
+        #     raise FileNotFoundError(f"Delta table at {self.table_uri} does not exist. Always create before appending to make sure configuration settings are set correctly. (Concurrent writers may cause cause problems when changing configuration settings.)")
         
         tbl = pa.Table.from_pydict(self.buf, schema=self.schema)
         delay = self.retry_config.base_sleep
