@@ -1,4 +1,4 @@
-import os, io, json, time, hashlib, zlib, fcntl, msgpack, atexit, shutil, uuid, random, warnings, atexit
+import os, io, json, time, hashlib, zlib, fcntl, msgpack, atexit, shutil, uuid, random, warnings, atexit, logging
 from typing import Iterator, Optional, TypedDict, Dict, Any, List, Tuple
 import zstandard as zstd
 import numpy as np
@@ -7,6 +7,13 @@ import pyarrow.dataset as ds
 
 from socket import gethostname
 from dataclasses import dataclass, field
+
+logger = logging.getLogger(__name__)
+
+# --------------- Custom exceptions ---------------
+class LeaseMismatchRetry(Exception):
+    """Raised when a lease mismatch is detected, signaling the caller should retry with a new shard."""
+    pass
 
 from deltalake import write_deltalake, DeltaTable
 from deltalake.exceptions import DeltaError
@@ -563,24 +570,36 @@ class ShardPackWriter:
                 print(f"[{self._process_id}] append: shard={os.path.basename(shard_path)} claim_exists={claim_exists} in_memory_lease={lease_id[:12] if lease_id else None}... disk_meta={meta}")
             
             if not (lease_id and meta and meta.get("lease_id") == lease_id):
-                # Detailed diagnostics before raising
-                print(f"[{self._process_id}] LEASE MISMATCH DETAILS:")
-                print(f"  shard_path: {shard_path}")
-                print(f"  claim_dir: {claim_dir}")
-                print(f"  claim_dir_exists: {claim_exists}")
-                print(f"  in_memory_lease_id: {lease_id}")
-                print(f"  disk_meta: {meta}")
-                print(f"  _owned_claims keys: {list(self._owned_claims.keys())}")
-                print(f"  _current_shard: {self._current_shard}")
-                # Try to get fresh stat info
+                # Log warning with detailed diagnostics instead of raising RuntimeError
+                logger.warning(
+                    f"[{self._process_id}] LEASE MISMATCH - will retry with new shard. "
+                    f"shard_path={shard_path}, claim_dir={claim_dir}, claim_exists={claim_exists}, "
+                    f"in_memory_lease={lease_id}, disk_lease={meta.get('lease_id') if meta else None}"
+                )
+                if self.verbose:
+                    print(f"[{self._process_id}] LEASE MISMATCH DETAILS:")
+                    print(f"  shard_path: {shard_path}")
+                    print(f"  claim_dir: {claim_dir}")
+                    print(f"  claim_dir_exists: {claim_exists}")
+                    print(f"  in_memory_lease_id: {lease_id}")
+                    print(f"  disk_meta: {meta}")
+                    print(f"  _owned_claims keys: {list(self._owned_claims.keys())}")
+                    print(f"  _current_shard: {self._current_shard}")
+                    # Try to get fresh stat info
+                    if claim_dir:
+                        try:
+                            stat_info = os.stat(claim_dir)
+                            print(f"  claim_dir stat: mtime={stat_info.st_mtime} ({time.time() - stat_info.st_mtime:.1f}s ago)")
+                        except Exception as e:
+                            print(f"  claim_dir stat failed: {e}")
+                
+                # Clear state so caller can retry with a new shard
+                self._current_shard = None
                 if claim_dir:
-                    try:
-                        stat_info = os.stat(claim_dir)
-                        print(f"  claim_dir stat: mtime={stat_info.st_mtime} ({time.time() - stat_info.st_mtime:.1f}s ago)")
-                    except Exception as e:
-                        print(f"  claim_dir stat failed: {e}")
-                raise RuntimeError(
-                    f"Shard {shard_path} is not leased by this process (lease mismatch or missing).\nmeta: {meta}\nlease_id: {lease_id}"
+                    self._owned_claims.pop(claim_dir, None)
+                
+                raise LeaseMismatchRetry(
+                    f"Shard {shard_path} lease lost (stolen by another process). Retry with new shard."
                 )
 
         fd = os.open(shard_path, os.O_CREAT | os.O_RDWR, 0o644)
@@ -1065,14 +1084,12 @@ class AF3ProtlakeWriter:
         name: str,
         sample_idx: int,
         seed: int,
+        max_lease_retries: int = 2000,
     ) -> None:
-        # pick shards for this run
-        bcif_shard_path = self.bcif_packer.choose_shard()  # guarantees same shard per input_dir
-        if self.cfg.write_json_shards:
-            json_shard_path = self.json_packer.choose_shard()  # guarantees same shard per input_dir
-        
+        # Prepare data once (expensive operations)
         bcif_bytes = cif_bytes_to_bcif_bytes(cif, rtol=self.cfg.rtol, atol=self.cfg.atol)
-
+        
+        json_pack_bytes_comp = None
         if self.cfg.write_json_shards:
             json_pack_bytes = msgpack.packb(
                 _round_af3_StructureConfidence_dict(
@@ -1083,18 +1100,45 @@ class AF3ProtlakeWriter:
                 use_bin_type=True,
                 use_single_float=True
             )
-
             compressor = zstd.ZstdCompressor(level=12)
             json_pack_bytes_comp = compressor.compress(json_pack_bytes)
-            # Append json to shard
-            json_pack = self.json_packer.append(json_shard_path, json_pack_bytes_comp, rec_id=None)
-            if self.cfg.verbose:
-                print(f"packed id={json_pack['id_hex'][:12]}…  shard={os.path.basename(json_pack['shard_path'])} off={json_pack['off']} len={json_pack['length']}")
 
-        # Append cif to shard
-        bcif_pack = self.bcif_packer.append(bcif_shard_path, bcif_bytes, rec_id=None)
-        if self.cfg.verbose:
-            print(f"packed id={bcif_pack['id_hex'][:12]}…  shard={os.path.basename(bcif_pack['shard_path'])} off={bcif_pack['off']} len={bcif_pack['length']}")
+        # Retry loop for lease mismatch scenarios (e.g., after SLURM preemption)
+        for attempt in range(1, max_lease_retries + 1):
+            try:
+                # pick shards for this run
+                bcif_shard_path = self.bcif_packer.choose_shard()
+                if self.cfg.write_json_shards:
+                    json_shard_path = self.json_packer.choose_shard()
+
+                if self.cfg.write_json_shards:
+                    # Append json to shard
+                    json_pack = self.json_packer.append(json_shard_path, json_pack_bytes_comp, rec_id=None)
+                    if self.cfg.verbose:
+                        print(f"packed id={json_pack['id_hex'][:12]}…  shard={os.path.basename(json_pack['shard_path'])} off={json_pack['off']} len={json_pack['length']}")
+
+                # Append cif to shard
+                bcif_pack = self.bcif_packer.append(bcif_shard_path, bcif_bytes, rec_id=None)
+                if self.cfg.verbose:
+                    print(f"packed id={bcif_pack['id_hex'][:12]}…  shard={os.path.basename(bcif_pack['shard_path'])} off={bcif_pack['off']} len={bcif_pack['length']}")
+                
+                # Success - break out of retry loop
+                break
+                
+            except LeaseMismatchRetry as e:
+                if attempt >= max_lease_retries:
+                    raise RuntimeError(
+                        f"Failed to write after {max_lease_retries} lease retry attempts. "
+                        f"All shards appear contested. Last error: {e}"
+                    )
+                # Log and retry with exponential backoff
+                backoff = min(0.1 * (1.5 ** min(attempt, 10)), 5.0) * random.uniform(0.8, 1.2)
+                logger.warning(
+                    f"Lease mismatch on attempt {attempt}/{max_lease_retries}, "
+                    f"retrying in {backoff:.2f}s..."
+                )
+                time.sleep(backoff)
+                continue
 
         # Build rows
         common = dict(
