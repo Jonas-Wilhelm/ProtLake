@@ -182,16 +182,14 @@ class ShardPackWriter:
         use_claims: if True, use mkdir-based claim directories to avoid multiple processes
                     writing to the same shard. 
         claim_ttl: when using claims, consider a claim stale after this many seconds
-        verbose: if True, print debug information for claim operations
     """
     def __init__(self, shard_dir: str, prefix: str = "bcif-pack", max_bytes: int = 1 << 30,
-                 use_claims: bool = False, claim_ttl: int = 300, verbose: bool = False):
+                 use_claims: bool = False, claim_ttl: int = 300):
         self.shard_dir = os.path.realpath(shard_dir)
         self.prefix = prefix
         self.max_bytes = max_bytes
         self.use_claims = use_claims
         self.claim_ttl = claim_ttl
-        self.verbose = verbose
         self._current_shard: Optional[str] = None
         self._process_id = f"{gethostname()}:{os.getpid()}"  # for debug output
 
@@ -254,8 +252,7 @@ class ShardPackWriter:
         now = time.time()
         age = now - mtime
         is_stale = age > self.claim_ttl
-        if self.verbose:
-            logger.debug(f"[{self._process_id}] _is_claim_stale: {os.path.basename(claim_dir)} age={age:.1f}s ttl={self.claim_ttl}s stale={is_stale}")
+        logger.debug(f"[{self._process_id}] _is_claim_stale: {os.path.basename(claim_dir)} age={age:.1f}s ttl={self.claim_ttl}s stale={is_stale}")
         return is_stale
 
     def _try_mkdir_claim(self, claim_dir: str) -> bool:
@@ -263,11 +260,9 @@ class ShardPackWriter:
             return False
         try:
             os.mkdir(claim_dir)
-            if self.verbose:
-                logger.debug(f"[{self._process_id}] _try_mkdir_claim: created {os.path.basename(claim_dir)}")
+            logger.debug(f"[{self._process_id}] _try_mkdir_claim: created {os.path.basename(claim_dir)}")
         except FileExistsError:
-            if self.verbose:
-                logger.debug(f"[{self._process_id}] _try_mkdir_claim: {os.path.basename(claim_dir)} already exists")
+            logger.debug(f"[{self._process_id}] _try_mkdir_claim: {os.path.basename(claim_dir)} already exists")
             return False
         # created -> write metadata
         # Generate a new lease token
@@ -276,8 +271,7 @@ class ShardPackWriter:
             self._write_claim_meta(claim_dir, lease_id)
         except Exception as e:
             # If we can't write metadata reliably, back out of the claim
-            if self.verbose:
-                logger.debug(f"[{self._process_id}] _try_mkdir_claim: write_claim_meta failed: {e}")
+            logger.debug(f"[{self._process_id}] _try_mkdir_claim: write_claim_meta failed: {e}")
             try:
                 shutil.rmtree(claim_dir)
             except Exception:
@@ -286,8 +280,7 @@ class ShardPackWriter:
 
         # Track our lease string in-process
         self._owned_claims[claim_dir] = lease_id
-        if self.verbose:
-            logger.debug(f"[{self._process_id}] _try_mkdir_claim: SUCCESS - claimed {os.path.basename(claim_dir)}, lease_id={lease_id[:12]}...")
+        logger.debug(f"[{self._process_id}] _try_mkdir_claim: SUCCESS - claimed {os.path.basename(claim_dir)}, lease_id={lease_id[:12]}...")
         return True
 
     def _steal_stale_claim(self, claim_dir: str, shard_path: str) -> bool:
@@ -298,48 +291,40 @@ class ShardPackWriter:
         
         # Read existing claim metadata before checking staleness
         old_meta = self._read_claim_meta(claim_dir)
-        if self.verbose:
-            logger.debug(f"[{self._process_id}] _steal_stale_claim: attempting to steal {os.path.basename(claim_dir)}, old_meta={old_meta}")
+        logger.debug(f"[{self._process_id}] _steal_stale_claim: attempting to steal {os.path.basename(claim_dir)}, old_meta={old_meta}")
         
         if not self._is_claim_stale(claim_dir):
-            if self.verbose:
-                logger.debug(f"[{self._process_id}] _steal_stale_claim: {os.path.basename(claim_dir)} not stale (first check), aborting")
+            logger.debug(f"[{self._process_id}] _steal_stale_claim: {os.path.basename(claim_dir)} not stale (first check), aborting")
             return False
         # To avoid race conditions, sleep a small random amount before proceeding
         time.sleep(random.uniform(0.25, 1.5))
         # Check again if still stale
         if not os.path.exists(claim_dir):
-            if self.verbose:
-                logger.debug(f"[{self._process_id}] _steal_stale_claim: {os.path.basename(claim_dir)} disappeared after sleep")
+            logger.debug(f"[{self._process_id}] _steal_stale_claim: {os.path.basename(claim_dir)} disappeared after sleep")
             return False
         if not self._is_claim_stale(claim_dir):
-            if self.verbose:
-                logger.debug(f"[{self._process_id}] _steal_stale_claim: {os.path.basename(claim_dir)} no longer stale (second check), aborting")
+            logger.debug(f"[{self._process_id}] _steal_stale_claim: {os.path.basename(claim_dir)} no longer stale (second check), aborting")
             return False
         
         # If the shard is already full, don't steal
         if os.path.exists(shard_path) and os.path.getsize(shard_path) >= self.max_bytes:
-            if self.verbose:
-                logger.debug(f"[{self._process_id}] _steal_stale_claim: shard {os.path.basename(shard_path)} is full, skipping")
+            logger.debug(f"[{self._process_id}] _steal_stale_claim: shard {os.path.basename(shard_path)} is full, skipping")
             return False
 
         stale_name = claim_dir + f".stale.{os.getpid()}.{int(time.time())}"
         # move claim_dir to a temporary name (atomic on same filesystem)
         try:
             os.rename(claim_dir, stale_name)
-            if self.verbose:
-                logger.debug(f"[{self._process_id}] _steal_stale_claim: renamed {os.path.basename(claim_dir)} -> {os.path.basename(stale_name)}")
+            logger.debug(f"[{self._process_id}] _steal_stale_claim: renamed {os.path.basename(claim_dir)} -> {os.path.basename(stale_name)}")
         except Exception as e:
             # rename failed (race or NFS weirdness) -> give up for now
-            if self.verbose:
-                logger.debug(f"[{self._process_id}] _steal_stale_claim: rename failed: {e}")
+            logger.debug(f"[{self._process_id}] _steal_stale_claim: rename failed: {e}")
             return False
         try:
             os.mkdir(claim_dir)
         except Exception as e:
             # if someone beat us to it, try to clean up stale_name then give up
-            if self.verbose:
-                logger.debug(f"[{self._process_id}] _steal_stale_claim: mkdir failed after rename: {e}")
+            logger.debug(f"[{self._process_id}] _steal_stale_claim: mkdir failed after rename: {e}")
             try:
                 shutil.rmtree(stale_name)
             except Exception:
@@ -351,8 +336,7 @@ class ShardPackWriter:
             self._write_claim_meta(claim_dir, lease_id)
         except Exception as e:
             # failed to write metadata -> back out of claim
-            if self.verbose:
-                logger.debug(f"[{self._process_id}] _steal_stale_claim: write_claim_meta failed: {e}")
+            logger.debug(f"[{self._process_id}] _steal_stale_claim: write_claim_meta failed: {e}")
             try:
                 shutil.rmtree(claim_dir)
             except Exception:
@@ -368,9 +352,21 @@ class ShardPackWriter:
         except Exception:
             pass
         self._owned_claims[claim_dir] = lease_id
-        if self.verbose:
-            logger.debug(f"[{self._process_id}] _steal_stale_claim: SUCCESS - stole {os.path.basename(claim_dir)}, new lease_id={lease_id[:12]}...")
+        logger.debug(f"[{self._process_id}] _steal_stale_claim: SUCCESS - stole {os.path.basename(claim_dir)}, new lease_id={lease_id[:12]}...")
         return True
+
+    def _verify_claim_ownership(self, claim_dir: str) -> bool:
+        """Poll owner.json a few times to ensure our lease is visible (NFS may delay visibility)."""
+        if not self.use_claims:
+            return True
+        for _ in range(5):
+            time.sleep(random.uniform(0.05, 0.1))
+            meta = self._read_claim_meta(claim_dir)
+            lease_id = self._owned_claims.get(claim_dir)
+            if lease_id and meta and meta.get("lease_id") == lease_id:
+                return True
+        logger.debug(f"[{self._process_id}] _verify_claim_ownership: failed to verify ownership of {os.path.basename(claim_dir)}")
+        return False
 
     def release_shard(self, shard_path: str) -> None:
         """Remove our claim on shard_path if (and only if) our lease still matches on disk."""
@@ -429,8 +425,7 @@ class ShardPackWriter:
                 claim_exists = os.path.exists(claim_dir)
                 meta = self._read_claim_meta(claim_dir) if claim_exists else None
                 
-                if self.verbose:
-                    logger.debug(f"[{self._process_id}] choose_shard: revalidating {os.path.basename(shard)}, claim_exists={claim_exists}, in_memory_lease={lease_id[:12] if lease_id else None}..., disk_lease={meta.get('lease_id', 'N/A')[:12] if meta else None}...")
+                logger.debug(f"[{self._process_id}] choose_shard: revalidating {os.path.basename(shard)}, claim_exists={claim_exists}, in_memory_lease={lease_id[:12] if lease_id else None}..., disk_lease={meta.get('lease_id', 'N/A')[:12] if meta else None}...")
                 
                 if (lease_id is not None and meta is not None and meta.get("lease_id") == lease_id):
                     # we still own the lease
@@ -440,15 +435,13 @@ class ShardPackWriter:
                         return self._current_shard
                     if os.path.getsize(shard) >= self.max_bytes:
                         # shard is full, release claim
-                        if self.verbose:
-                            logger.debug(f"[{self._process_id}] choose_shard: shard {os.path.basename(shard)} is full, releasing")
+                        logger.debug(f"[{self._process_id}] choose_shard: shard {os.path.basename(shard)} is full, releasing")
                         self.release_shard(shard)
                         self._current_shard = None
                     # if the shard is full, release our claim
                 else:
                     # Lost the lease
-                    if self.verbose:
-                        logger.debug(f"[{self._process_id}] choose_shard: LOST LEASE on {os.path.basename(shard)}! in_memory={lease_id[:12] if lease_id else None}..., disk_meta={meta}")
+                    logger.debug(f"[{self._process_id}] choose_shard: LOST LEASE on {os.path.basename(shard)}! in_memory={lease_id[:12] if lease_id else None}..., disk_meta={meta}")
                 self._current_shard = None
 
         # No current shard: find a new one
@@ -468,79 +461,94 @@ class ShardPackWriter:
                     return shard
                 i += 1
 
-        # claim-mode behaviour
-        i = 0
+        # claim-mode behaviour: collect candidates first to avoid thundering herd
         while True:
-            shard = os.path.realpath(os.path.join(self.shard_dir, f"{self.prefix}-{i:06d}.pack"))
-            claim_dir = self._claim_dir(shard)
-
-            # If a claim exists, consider stealing if stale
-            if os.path.exists(claim_dir):
-                if self._is_claim_stale(claim_dir):
-                    if self._steal_stale_claim(claim_dir, shard):
-                        # we now own the claim (lease set in _try_mkdir_claim)
-                        # poll owner.json a few times to ensure its visible (NFS may delay visibility)
-                        ok = False
-                        for _ in range(5):
-                            time.sleep(random.uniform(0.05, 0.1))
-                            meta = self._read_claim_meta(claim_dir)
-                            lease_id = self._owned_claims.get(claim_dir)
-                            if lease_id and meta and meta.get("lease_id") == lease_id:
-                                ok = True
-                                break
-                        if not ok:
-                            # failed to steal (race), try next
-                            i += 1
-                            # slight backoff
-                            time.sleep(random.uniform(0.05, 0.5))
-                            continue
+            # Each iteration of this outer loop is a full scan attempt
+            candidates: List[Tuple[str, str, str]] = []  # (shard_path, claim_dir, action: 'steal' or 'claim')
+            first_nonexistent_shard: Optional[str] = None
+            
+            i = 0
+            while True:
+                shard = os.path.realpath(os.path.join(self.shard_dir, f"{self.prefix}-{i:06d}.pack"))
+                claim_dir = self._claim_dir(shard)
+                shard_exists = os.path.exists(shard)
+                claim_exists = os.path.exists(claim_dir)
+                
+                # Non-existent shard: end of scan
+                if not shard_exists:
+                    first_nonexistent_shard = shard
+                    break
+                
+                shard_full = os.path.getsize(shard) >= self.max_bytes
+                
+                if claim_exists:
+                    if self._is_claim_stale(claim_dir) and not shard_full:
+                        # Stale claim on non-full shard: candidate to steal
+                        candidates.append((shard, claim_dir, 'steal'))
+                        logger.debug(f"[{self._process_id}] choose_shard: found stale claim candidate {os.path.basename(shard)}")
+                    # else: active claim or full shard, skip
+                else:
+                    # No claim exists
+                    if not shard_full:
+                        # Non-full shard without claim: candidate to claim
+                        candidates.append((shard, claim_dir, 'claim'))
+                        logger.debug(f"[{self._process_id}] choose_shard: found unclaimed candidate {os.path.basename(shard)}")
+                
+                i += 1
+            
+            logger.debug(f"[{self._process_id}] choose_shard: scan complete. {len(candidates)} candidates, first_nonexistent={os.path.basename(first_nonexistent_shard) if first_nonexistent_shard else None}")
+            
+            # Decision logic
+            if not candidates:
+                # No candidates found, use the first non-existent shard
+                shard = first_nonexistent_shard
+                claim_dir = self._claim_dir(shard)
+                if self._try_mkdir_claim(claim_dir):
+                    if self._verify_claim_ownership(claim_dir):
                         fd = os.open(shard, os.O_CREAT | os.O_RDWR, 0o644)
                         os.close(fd)
                         self._current_shard = shard
                         return shard
-                    else:
-                        # failed to steal (race); skip to next
-                        i += 1
-                        # slight backoff
-                        time.sleep(random.uniform(0.05, 0.5))
-                        continue
-                else:
-                    # someone else owns an active claim; skip
-                    i += 1
+                # Failed to claim new shard, restart scan
+                time.sleep(random.uniform(0.05, 0.5))
+                continue
+            
+            # Candidates exist: wait random delay then pick one randomly
+            time.sleep(random.uniform(0.0, 1.0))
+            
+            # Shuffle and try candidates
+            random.shuffle(candidates)
+            for shard, claim_dir, action in candidates:
+                # Re-check conditions as they may have changed during delay
+                if not os.path.exists(shard):
+                    # Shard was deleted, skip
                     continue
-
-            # No claim exists. If shard is free (non-existent or not full), try to claim it
-            if not os.path.exists(shard) or os.path.getsize(shard) < self.max_bytes:
-                if self._try_mkdir_claim(claim_dir):
-                    # we now own the claim (lease set in _try_mkdir_claim)
-                    # poll owner.json a few times to ensure its visible (NFS may delay visibility)
-                    ok = False
-                    for _ in range(5):
-                        time.sleep(random.uniform(0.05, 0.1))
-                        meta = self._read_claim_meta(claim_dir)
-                        lease_id = self._owned_claims.get(claim_dir)
-                        if lease_id and meta and meta.get("lease_id") == lease_id:
-                            ok = True
-                            break
-                    if not ok:
-                        # lost race creating claim, try next
-                        i += 1
-                        # slight backoff
-                        time.sleep(random.uniform(0.05, 0.5))
-                        continue
+                if os.path.getsize(shard) >= self.max_bytes:
+                    # Shard is now full, skip
+                    continue
+                
+                success = False
+                if action == 'steal':
+                    # Re-verify claim is still stale
+                    if os.path.exists(claim_dir) and self._is_claim_stale(claim_dir):
+                        success = self._steal_stale_claim(claim_dir, shard)
+                elif action == 'claim':
+                    # Re-verify no claim exists
+                    if not os.path.exists(claim_dir):
+                        success = self._try_mkdir_claim(claim_dir)
+                
+                if success and self._verify_claim_ownership(claim_dir):
                     fd = os.open(shard, os.O_CREAT | os.O_RDWR, 0o644)
                     os.close(fd)
                     self._current_shard = shard
                     return shard
-                else:
-                    # lost race creating claim, try next
-                    i += 1
-                    # slight backoff
-                    time.sleep(random.uniform(0.05, 0.5))
-                    continue
-
-            # shard exists and is full -> next
-            i += 1
+                
+                # Failed this candidate, try next
+                logger.debug(f"[{self._process_id}] choose_shard: failed to {action} {os.path.basename(shard)}, trying next candidate")
+            
+            # All candidates failed, restart scan with backoff
+            logger.debug(f"[{self._process_id}] choose_shard: all candidates failed, restarting scan")
+            time.sleep(random.uniform(0.1, 0.5))
 
     # ---------- append ----------
     def append(self, shard_path: str, payload: bytes, rec_id: Optional[bytes] = None) -> PackRecord:
@@ -565,8 +573,7 @@ class ShardPackWriter:
             claim_exists = claim_dir and os.path.exists(claim_dir)
             meta = self._read_claim_meta(claim_dir) if claim_exists else None
             
-            if self.verbose:
-                logger.debug(f"[{self._process_id}] append: shard={os.path.basename(shard_path)} claim_exists={claim_exists} in_memory_lease={lease_id[:12] if lease_id else None}... disk_meta={meta}")
+            logger.debug(f"[{self._process_id}] append: shard={os.path.basename(shard_path)} claim_exists={claim_exists} in_memory_lease={lease_id[:12] if lease_id else None}... disk_meta={meta}")
             
             if not (lease_id and meta and meta.get("lease_id") == lease_id):
                 # Log warning with detailed diagnostics instead of raising RuntimeError
@@ -575,22 +582,21 @@ class ShardPackWriter:
                     f"shard_path={shard_path}, claim_dir={claim_dir}, claim_exists={claim_exists}, "
                     f"in_memory_lease={lease_id}, disk_lease={meta.get('lease_id') if meta else None}"
                 )
-                if self.verbose:
-                    logger.debug(f"[{self._process_id}] LEASE MISMATCH DETAILS:")
-                    logger.debug(f"  shard_path: {shard_path}")
-                    logger.debug(f"  claim_dir: {claim_dir}")
-                    logger.debug(f"  claim_dir_exists: {claim_exists}")
-                    logger.debug(f"  in_memory_lease_id: {lease_id}")
-                    logger.debug(f"  disk_meta: {meta}")
-                    logger.debug(f"  _owned_claims keys: {list(self._owned_claims.keys())}")
-                    logger.debug(f"  _current_shard: {self._current_shard}")
-                    # Try to get fresh stat info
-                    if claim_dir:
-                        try:
-                            stat_info = os.stat(claim_dir)
-                            logger.debug(f"  claim_dir stat: mtime={stat_info.st_mtime} ({time.time() - stat_info.st_mtime:.1f}s ago)")
-                        except Exception as e:
-                            logger.debug(f"  claim_dir stat failed: {e}")
+                logger.debug(f"[{self._process_id}] LEASE MISMATCH DETAILS:")
+                logger.debug(f"  shard_path: {shard_path}")
+                logger.debug(f"  claim_dir: {claim_dir}")
+                logger.debug(f"  claim_dir_exists: {claim_exists}")
+                logger.debug(f"  in_memory_lease_id: {lease_id}")
+                logger.debug(f"  disk_meta: {meta}")
+                logger.debug(f"  _owned_claims keys: {list(self._owned_claims.keys())}")
+                logger.debug(f"  _current_shard: {self._current_shard}")
+                # Try to get fresh stat info
+                if claim_dir:
+                    try:
+                        stat_info = os.stat(claim_dir)
+                        logger.debug(f"  claim_dir stat: mtime={stat_info.st_mtime} ({time.time() - stat_info.st_mtime:.1f}s ago)")
+                    except Exception as e:
+                        logger.debug(f"  claim_dir stat failed: {e}")
                 
                 # Clear state so caller can retry with a new shard
                 self._current_shard = None
@@ -739,7 +745,6 @@ class IngestConfig:
     out_path: str
     batch_size_metadata: int = 2500
     shard_size: int = 1 << 30
-    verbose: bool = False
     rtol: float = 1e-6
     atol: float = 1e-4
     bcif_shard_prefix: str = "bcif-pack"
@@ -758,10 +763,10 @@ class AF3IngestPipeline:
         ensure_dirs([self.shard_dir, self.delta_path])
 
         self.bcif_packer = ShardPackWriter(self.shard_dir, prefix=cfg.bcif_shard_prefix, max_bytes=cfg.shard_size,
-                                          use_claims=cfg.claim_mode, claim_ttl=cfg.claim_ttl, verbose=cfg.verbose)
+                                          use_claims=cfg.claim_mode, claim_ttl=cfg.claim_ttl)
         if cfg.write_json_shards:
             self.json_packer = ShardPackWriter(self.shard_dir, prefix=cfg.json_shard_prefix, max_bytes=cfg.shard_size,
-                                          use_claims=cfg.claim_mode, claim_ttl=cfg.claim_ttl, verbose=cfg.verbose)
+                                          use_claims=cfg.claim_mode, claim_ttl=cfg.claim_ttl)
         self.delta_appender = DeltaAppender(self.delta_path, CORE_SCHEMA, batch_size=cfg.batch_size_metadata, retry_config=cfg.retry_conf)
         self.loader = MetadataLoader()
         self.scanner = RunScanner()
@@ -789,9 +794,8 @@ class AF3IngestPipeline:
                 return
             else:
                 logger.info(f"Skipping {len(input_dirs) - len(non_existing_input_dirs)} already ingested runs.")
-                if self.cfg.verbose:
-                    skipped = [os.path.basename(os.path.normpath(d)) for d in input_dirs if os.path.basename(os.path.normpath(d)) in existing_names]
-                    logger.debug(f"The following runs were skipped: {', '.join(skipped)}")
+                skipped = [os.path.basename(os.path.normpath(d)) for d in input_dirs if os.path.basename(os.path.normpath(d)) in existing_names]
+                logger.debug(f"The following runs were skipped: {', '.join(skipped)}")
                 input_dirs = non_existing_input_dirs
 
         for input_dir in input_dirs:
@@ -814,13 +818,11 @@ class AF3IngestPipeline:
                     json_pack_bytes_comp = compressor.compress(json_pack_bytes)
                     # Append json to shard
                     json_pack = self.json_packer.append(json_shard_path_for_run, json_pack_bytes_comp, rec_id=None)
-                    if self.cfg.verbose:
-                        logger.debug(f"packed id={json_pack['id_hex'][:12]}…  shard={os.path.basename(json_pack['shard_path'])} off={json_pack['off']} len={json_pack['length']}  src={item['src_dir']}")
+                    logger.debug(f"packed id={json_pack['id_hex'][:12]}…  shard={os.path.basename(json_pack['shard_path'])} off={json_pack['off']} len={json_pack['length']}  src={item['src_dir']}")
 
                 # Append cif to shard
                 bcif_pack = self.bcif_packer.append(bcif_shard_path_for_run, bcif_bytes, rec_id=None)
-                if self.cfg.verbose:
-                    logger.debug(f"packed id={bcif_pack['id_hex'][:12]}…  shard={os.path.basename(bcif_pack['shard_path'])} off={bcif_pack['off']} len={bcif_pack['length']}  src={item['src_dir']}")
+                logger.debug(f"packed id={bcif_pack['id_hex'][:12]}…  shard={os.path.basename(bcif_pack['shard_path'])} off={bcif_pack['off']} len={bcif_pack['length']}  src={item['src_dir']}")
 
                 # Build rows
                 common = dict(
@@ -853,8 +855,7 @@ class AF3IngestPipeline:
             if self.cfg.delete_input_after_ingest:
                 try:
                     shutil.rmtree(input_dir)
-                    if self.cfg.verbose:
-                        logger.debug(f"Deleted input directory {input_dir} to save space.")
+                    logger.debug(f"Deleted input directory {input_dir} to save space.")
                 except Exception as e:
                     logger.warning(f"Failed to delete input directory {input_dir}: {e}")
                     
@@ -873,7 +874,6 @@ class AF3ProtlakeWriter:
             max_bytes=cfg.shard_size,
             use_claims=cfg.claim_mode, 
             claim_ttl=cfg.claim_ttl,
-            verbose=cfg.verbose
         )
 
         if cfg.write_json_shards:
@@ -883,7 +883,6 @@ class AF3ProtlakeWriter:
                 max_bytes=cfg.shard_size,
                 use_claims=cfg.claim_mode, 
                 claim_ttl=cfg.claim_ttl,
-                verbose=cfg.verbose
             )
 
         self.delta_appender = DeltaAppender(self.delta_path, CORE_SCHEMA, batch_size=cfg.batch_size_metadata, retry_config=cfg.retry_conf)
@@ -1112,13 +1111,11 @@ class AF3ProtlakeWriter:
                 if self.cfg.write_json_shards:
                     # Append json to shard
                     json_pack = self.json_packer.append(json_shard_path, json_pack_bytes_comp, rec_id=None)
-                    if self.cfg.verbose:
-                        logger.debug(f"packed id={json_pack['id_hex'][:12]}…  shard={os.path.basename(json_pack['shard_path'])} off={json_pack['off']} len={json_pack['length']}")
+                    logger.debug(f"packed id={json_pack['id_hex'][:12]}…  shard={os.path.basename(json_pack['shard_path'])} off={json_pack['off']} len={json_pack['length']}")
 
                 # Append cif to shard
                 bcif_pack = self.bcif_packer.append(bcif_shard_path, bcif_bytes, rec_id=None)
-                if self.cfg.verbose:
-                    logger.debug(f"packed id={bcif_pack['id_hex'][:12]}…  shard={os.path.basename(bcif_pack['shard_path'])} off={bcif_pack['off']} len={bcif_pack['length']}")
+                logger.debug(f"packed id={bcif_pack['id_hex'][:12]}…  shard={os.path.basename(bcif_pack['shard_path'])} off={bcif_pack['off']} len={bcif_pack['length']}")
                 
                 # Success - break out of retry loop
                 break
