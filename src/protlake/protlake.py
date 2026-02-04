@@ -97,9 +97,9 @@ class ProtLake():
         as_str: bool = False,
         df: Optional[pd.DataFrame] = None,
         append_seed_sample: bool = True,
-    ) -> None:
+    ) -> None | str | list[str]:
         
-        if out_dir is None:
+        if out_dir is None and not as_str:
             raise ValueError("out_dir must be specified.")
         
         if df is not None:
@@ -133,7 +133,10 @@ class ProtLake():
             if isinstance(file_names, str):
                 file_names = [file_names]
 
-        os.makedirs(out_dir, exist_ok=True)
+        if not as_str:
+            os.makedirs(out_dir, exist_ok=True)
+        else:
+            out_str_list = []
 
         for shard, offset, length, file_name in zip(bcif_shard, bcif_off, bcif_len, file_names):
             shard_path = os.path.join(self.shard_path, str(shard))
@@ -146,12 +149,16 @@ class ProtLake():
             try:
                 if as_str:
                     out_str = bcif_shard_to_mmCIF_str(shard_path, offset, length)
-                    return out_str
+                    out_str_list.append(out_str)
                 else:
                     bcif_shard_to_mmCIF_file(shard_path, offset, length, out_path)
             except Exception as e:
                 print(f"Error reading {shard_path} at offset {offset} with length {length}: {e}")
                 continue
+
+        if as_str:
+            # return list or if only one, return single string
+            return out_str_list if len(out_str_list) > 1 else out_str_list[0]
 
     # --------------- get_seq ---------------
     # ---------------------------------------
