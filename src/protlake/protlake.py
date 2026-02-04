@@ -5,6 +5,7 @@ from protlake.utils import (
     DeltaTable_nrow, 
     deltatable_maintenance,
     bcif_shard_to_mmCIF_file,
+    bcif_shard_to_mmCIF_str,
     pread_bcif_to_atom_array
 )
 from protlake.af3.ingest import CORE_SCHEMA
@@ -71,6 +72,7 @@ class ProtLake():
         file_names: str | list[str],
         out_dir: str,
         overwrite: bool = False,
+        as_str: bool = False,
     ) -> None: ...
 
     @overload
@@ -79,6 +81,7 @@ class ProtLake():
         *,
         out_dir: str,
         overwrite: bool = False,
+        as_str: bool = False,
         df: pd.DataFrame,
         append_seed_sample: bool = True,
     ) -> None: ...
@@ -91,6 +94,7 @@ class ProtLake():
         file_names: Optional[str | list[str]] = None,
         out_dir: str = None,
         overwrite: bool = False,
+        as_str: bool = False,
         df: Optional[pd.DataFrame] = None,
         append_seed_sample: bool = True,
     ) -> None:
@@ -140,7 +144,11 @@ class ProtLake():
                 print(f"File {out_path} exists, skipping...")
                 continue
             try:
-                bcif_shard_to_mmCIF_file(shard_path, offset, length, out_path)
+                if as_str:
+                    out_str = bcif_shard_to_mmCIF_str(shard_path, offset, length)
+                    return out_str
+                else:
+                    bcif_shard_to_mmCIF_file(shard_path, offset, length, out_path)
             except Exception as e:
                 print(f"Error reading {shard_path} at offset {offset} with length {length}: {e}")
                 continue

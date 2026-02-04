@@ -121,6 +121,16 @@ def _bcif_bytes_to_atom_array(bcif_data: bytes):
     bcif = BinaryCIFFile.read(f)
     return get_structure(bcif, extra_fields=['b_factor'], model=1)
 
+def _bcif_bytes_to_mmCIF_str(bcif_data: bytes):
+    f = io.BytesIO(bcif_data)
+    bcif = BinaryCIFFile.read(f)
+    atoms = get_structure(bcif, extra_fields=['b_factor'], model=1)
+    cif = CIFFile()
+    set_structure(cif, atoms)
+    out = io.StringIO()
+    cif.write(out)
+    return out.getvalue()
+
 def _bcif_bytes_to_mmCIF_file(bcif_data: bytes, path: str):
     f = io.BytesIO(bcif_data)
     bcif = BinaryCIFFile.read(f)
@@ -167,6 +177,10 @@ def pread_bcif_to_atom_array(path, offset, length):
 def bcif_shard_to_mmCIF_file(shard_path, offset, length, out_path):
     bcif_data = read_bytes_from_shard(shard_path, offset, length)
     return _bcif_bytes_to_mmCIF_file(bcif_data, out_path)
+
+def bcif_shard_to_mmCIF_str(shard_path, offset, length):
+    bcif_data = read_bytes_from_shard(shard_path, offset, length)
+    return _bcif_bytes_to_mmCIF_str(bcif_data)
 
 def pread_json_msgpack_to_dict(path, offset, length):
     json_msgpack_bytes_comp = read_bytes_from_shard(path, offset, length)
