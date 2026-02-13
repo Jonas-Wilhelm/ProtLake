@@ -278,3 +278,17 @@ def dump_random_cif_from_deltalake(dt, out_path='dump.cif', shard_dir=None):
             save_structure(out_path, atom_array)
             return True
     raise ValueError("No rows found in Delta Lake table")
+
+
+def is_retryable_delta_error(e: Exception) -> bool:
+    """
+    Only retry known concurrency conflicts
+    (most concurrency conflicts are retried internally by deltalake)
+    """
+    msg = str(e).lower()
+    retryable_phrases = [
+        "version 0 already exists",
+        "table metadata is invalid: number of checkpoint files", # '0' is not equal to number of checkpoint metadata parts 'None'
+        "generic deltatable error: non-contiguous log segment"
+    ]
+    return any(phrase in msg for phrase in retryable_phrases)
