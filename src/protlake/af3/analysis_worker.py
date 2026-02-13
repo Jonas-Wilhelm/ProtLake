@@ -1,6 +1,6 @@
 #!/usr/bin/env -S PYTHONUNBUFFERED=1 python
 
-import os, time, sys
+import os, time, sys, math, random
 from deltalake import DeltaTable, write_deltalake
 import pyarrow as pa
 import pyarrow.compute as pc
@@ -251,15 +251,19 @@ def main():
     shard_dir, delta_path = get_protlake_dirs(main_protlake_path)
     dt = DeltaTable(f"file://{os.path.abspath(delta_path)}", version=snapshot_ver)
     ds = dt.to_pyarrow_dataset()
-
+    
+    # Round array tasks to 1 significant figure
+    batch_multiplicator = int(round(num_array_tasks, -int(math.floor(math.log10(abs(num_array_tasks))))))
+    batch_size = min(1_000 * batch_multiplicator, 1_000_000)
+    print(f"Using batch size of {batch_size} for scanning with {num_array_tasks} array tasks")
     scanner = ds.scanner(
         # columns=["name"],       # project only what you need
         # filter=pc.field("col_c") < 9,              # pushdown what you can
-        batch_size=100_000
+        batch_size=batch_size
     )
     
     # process each batch
-    for batch in scanner.to_batches():    
+    for batch in scanner.to_batches():
         # initialize staging columns dict
         staging_columns = staging_col_dict()
         start_time = time.time()
@@ -405,7 +409,22 @@ def main():
             }
         )
 
-        write_deltalake(staging_path, staging_table, mode="append", configuration={'delta.checkpointInterval': '500'})
+        max_retries = 10
+        attempt = 1
+        while True:
+            try:
+                write_deltalake(staging_path, staging_table, mode="append", configuration={'delta.checkpointInterval': '500'})
+                break
+            except Exception as e:
+                print(f"Error writing to DeltaLake (attempt {attempt}/{max_retries})")
+                if attempt == max_retries:
+                    print("Max retries for writing to DeltaLake reached, raising exception.")
+                    raise e
+                else:
+                    wait_time = min(max(2 ** attempt, 10), 60*2) * random.uniform(0.8, 1.2)  # exponential backoff with jitter
+                    print(f"Retrying writing to DeltaLake in {wait_time:.1f} seconds...")
+                    time.sleep(wait_time)
+                    attempt += 1
 
 if __name__ == "__main__":
     main()
