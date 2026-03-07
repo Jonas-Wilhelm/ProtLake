@@ -54,7 +54,7 @@ def output_dir():
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     yield OUTPUT_DIR
     # Cleanup after all tests (optional - comment out to inspect output)
-    shutil.rmtree(OUTPUT_DIR)
+    # shutil.rmtree(OUTPUT_DIR)
 
 
 @pytest.fixture(scope="module")
@@ -118,6 +118,7 @@ def calculate_rmsd(atoms1: struc.AtomArray, atoms2: struc.AtomArray) -> float:
 def _parallel_worker_write(
     worker_id: int,
     out_path: str,
+    log_path: str,
     user_schema_bytes: bytes,
     base_cif_bytes: bytes,
     n_atoms: int,
@@ -125,11 +126,20 @@ def _parallel_worker_write(
 ) -> List[str]:
     """Worker function that writes noised structures (module-level for pickling)."""
     import io
+    import logging
     import numpy as np
     import pyarrow as pa
     import biotite.structure as struc
     import biotite.structure.io.pdbx as pdbx
     from protlake.write.writer import ProtlakeWriter, ProtlakeWriterConfig
+    
+    logging.basicConfig(
+        filename=Path(log_path) / f"worker_{worker_id}.log",
+        level=logging.DEBUG,
+        force=True,
+    )
+    logger = logging.getLogger(__name__)
+    logger.info(f"worker {worker_id} started")
 
     # Deserialize schema
     reader = pa.ipc.open_stream(user_schema_bytes)
@@ -328,6 +338,8 @@ class TestProtlakeWriterWriteParallel:
         from functools import partial
 
         parallel_output = output_dir / "parallel_test"
+        parallel_worker_logs = parallel_output / "logs"
+        os.makedirs(parallel_worker_logs, exist_ok=True)
 
         # Prepare base structure data for serialization to child processes
         cif_bytes_base = structure_to_cif_bytes(base_structure)
@@ -345,6 +357,7 @@ class TestProtlakeWriterWriteParallel:
             worker_fn = partial(
                 _parallel_worker_write,
                 out_path=str(parallel_output),
+                log_path=str(parallel_worker_logs),
                 user_schema_bytes=schema_bytes,
                 base_cif_bytes=cif_bytes_base,
                 n_atoms=n_atoms,
