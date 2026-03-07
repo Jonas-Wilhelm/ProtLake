@@ -21,27 +21,33 @@ class LeaseMismatchRetry(Exception):
 class RetryConfig:
     max_retries: int = 150
     base_sleep: float = 0.1
-    max_sleep: float = 5.5
+    max_sleep: float = 10.0
     jitter: float = 0.2
 
-def load_delta_table_with_retries(delta_path, base_sleep, jitter, max_sleep, max_retries):
-    """Load a DeltaTable with retries on known concurrency errors."""
-    delay = base_sleep
-    for attempt in range(1, max_retries + 1):
+def retry_with_backoff(operation, config: RetryConfig, description: str = "operation"):
+    """Execute an operation (DeltaTable loading or writing) with retries on known Delta concurrency errors."""
+    sleep_for = config.base_sleep
+    for attempt in range(1, config.max_retries + 1):
         try:
-            dt = DeltaTable(f"file://{os.path.abspath(delta_path)}")
-            break  # success
+            return operation()
         except DeltaError as e:
-            if attempt < max_retries and is_retryable_delta_error(e):
-                sleep_for = delay * (1 + jitter * random.uniform(-1, 1))
-                logger.warning(f"Loading deltatable failed with retryable error (attempt {attempt}/{max_retries}). Retrying in {sleep_for:.2f}s... error: {e}")
+            if attempt < config.max_retries and is_retryable_delta_error(e):
+                logger.warning(f"{description} failed with retryable error (attempt {attempt}/{config.max_retries}). Retrying in {sleep_for:.2f}s... error: {e}")
                 time.sleep(sleep_for)
-                delay = min(max_sleep, delay * 1.5)
+                sleep_for = min(sleep_for * 2, config.max_sleep) + random.uniform(-config.jitter, config.jitter)
+                sleep_for = max(0, sleep_for)  # ensure sleep_for is non-negative
                 continue
             # not retryable or out of retries
-            logger.error(f"Loading deltatable failed permanently after {attempt} attempts.")
+            logger.error(f"{description} failed permanently after {attempt} attempts.")
             raise
-    return dt
+
+def load_delta_table_with_retries(delta_path, retry_config: RetryConfig) -> DeltaTable:
+    """Load a DeltaTable with retries on known concurrency errors."""
+    return retry_with_backoff(
+        lambda: DeltaTable(f"file://{os.path.abspath(delta_path)}"),
+        retry_config,
+        "Loading deltatable"
+    )
 
 # --------------- small container format (PACK) ---------------
 MAGIC   = b"PACK"
@@ -242,7 +248,7 @@ class ShardPackWriter:
         if not self.use_claims:
             return True
         for _ in range(5):
-            time.sleep(random.uniform(0.05, 0.1))
+            time.sleep(random.uniform(0.1, 0.2))
             meta = self._read_claim_meta(claim_dir)
             lease_id = self._owned_claims.get(claim_dir)
             if lease_id and meta and meta.get("lease_id") == lease_id:
@@ -392,11 +398,11 @@ class ShardPackWriter:
                         self._current_shard = shard
                         return shard
                 # Failed to claim new shard, restart scan
-                time.sleep(random.uniform(0.05, 0.5))
+                time.sleep(random.uniform(0.1, 1.0))
                 continue
             
             # Candidates exist: wait random delay then pick one randomly
-            time.sleep(random.uniform(0.0, 1.0))
+            time.sleep(random.uniform(0.1, 1.0))
             
             # Shuffle and try candidates
             random.shuffle(candidates)
@@ -430,7 +436,7 @@ class ShardPackWriter:
             
             # All candidates failed, restart scan with backoff
             logger.debug(f"[{self._process_id}] choose_shard: all candidates failed, restarting scan")
-            time.sleep(random.uniform(0.1, 0.5))
+            time.sleep(random.uniform(0.1, 1.0))
 
     # ---------- append ----------
     def append(self, shard_path: str, payload: bytes, rec_id: Optional[bytes] = None) -> PackRecord:
@@ -542,22 +548,11 @@ class DeltaAppender:
         #     raise FileNotFoundError(f"Delta table at {self.table_uri} does not exist. Always create before appending to make sure configuration settings are set correctly. (Concurrent writers may cause cause problems when changing configuration settings.)")
         
         tbl = pa.Table.from_pydict(self.buf, schema=self.schema)
-        delay = self.retry_config.base_sleep
-        for attempt in range(1, self.retry_config.max_retries + 1):
-            try:
-                # mode="append" will create table if missing
-                write_deltalake(self.table_uri, tbl, mode="append", configuration={'delta.checkpointInterval': '500'})
-                break  # success
-            except DeltaError as e:
-                if attempt < self.retry_config.max_retries and is_retryable_delta_error(e):
-                    sleep_for = delay * (1 + self.retry_config.jitter * random.uniform(-1, 1))
-                    logger.warning(f"write_deltalake failed with retryable error (attempt {attempt}/{self.retry_config.max_retries}). Retrying in {sleep_for:.2f}s... error: {e}")
-                    time.sleep(sleep_for)
-                    delay = min(self.retry_config.max_sleep, delay * 1.5)
-                    continue
-                # not retryable or out of retries
-                logger.error(f"write_deltalake failed permanently after {attempt} attempts.")
-                raise
+        retry_with_backoff(
+            lambda: write_deltalake(self.table_uri, tbl, mode="append", configuration={'delta.checkpointInterval': '500'}),
+            self.retry_config,
+            "write_deltalake"
+        )
 
         for k in self.buf:
             self.buf[k].clear()

@@ -10,6 +10,7 @@ The required core prolake fields (id, bcif_shard, bcif_off, etc.) are automatica
 """
 
 import os
+import re
 import time
 import random
 import logging
@@ -191,7 +192,7 @@ class ProtlakeWriter:
         cif_bytes: bytes,
         light_metadata: Dict[str, Any],
         heavy_metadata: Optional[Dict[str, Any]] = None,
-        max_lease_retries: int = 2000,
+        max_lease_retries: int = 200,
     ) -> Dict[str, Any]:
         """
         Write a CIF structure with metadata to Protlake.
@@ -220,7 +221,7 @@ class ProtlakeWriter:
         cif_path: str,
         light_metadata: Dict[str, Any],
         heavy_metadata: Optional[Dict[str, Any]] = None,
-        max_lease_retries: int = 2000,
+        max_lease_retries: int = 200,
     ) -> Dict[str, Any]:
         """
         Write a CIF file with metadata to Protlake.
@@ -307,7 +308,7 @@ class ProtlakeWriter:
                         f"Failed to write after {max_lease_retries} lease retry attempts. "
                         f"All shards appear contested. Last error: {e}"
                     )
-                backoff = min(0.1 * (1.5 ** min(attempt, 10)), 5.0) * random.uniform(0.8, 1.2)
+                backoff = 5.0 * random.uniform(0.8, 1.2)
                 logger.warning(
                     f"Lease mismatch on attempt {attempt}/{max_lease_retries}, "
                     f"retrying in {backoff:.2f}s..."
@@ -393,10 +394,7 @@ class ProtlakeWriter:
         
         dt = load_delta_table_with_retries(
             delta_path=self.delta_path,
-            base_sleep=self.cfg.retry_conf.base_sleep,
-            jitter=self.cfg.retry_conf.jitter,
-            max_sleep=self.cfg.retry_conf.max_sleep,
-            max_retries=self.cfg.retry_conf.max_retries,
+            retry_config=self.cfg.retry_conf,
         )
         
         pa_dataset = dt.to_pyarrow_dataset()
@@ -462,10 +460,7 @@ class ProtlakeWriter:
         
         dt = load_delta_table_with_retries(
             delta_path=self.delta_path,
-            base_sleep=self.cfg.retry_conf.base_sleep,
-            jitter=self.cfg.retry_conf.jitter,
-            max_sleep=self.cfg.retry_conf.max_sleep,
-            max_retries=self.cfg.retry_conf.max_retries,
+            retry_config=self.cfg.retry_conf,
         )
         
         # Build isin filter on first key column for efficient pruning
@@ -516,10 +511,7 @@ class ProtlakeWriter:
         
         dt = load_delta_table_with_retries(
             delta_path=self.delta_path,
-            base_sleep=self.cfg.retry_conf.base_sleep,
-            jitter=self.cfg.retry_conf.jitter,
-            max_sleep=self.cfg.retry_conf.max_sleep,
-            max_retries=self.cfg.retry_conf.max_retries,
+            retry_config=self.cfg.retry_conf,
         )
         
         pa_dataset = dt.to_pyarrow_dataset()
