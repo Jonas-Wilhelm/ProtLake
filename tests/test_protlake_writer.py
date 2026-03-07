@@ -339,8 +339,9 @@ class TestProtlakeWriterWriteParallel:
         writer_schema.close()
         schema_bytes = sink.getvalue().to_pybytes()
 
-        # Spawn processes
-        with mp.Pool(processes=self.NUM_PROCESSES) as pool:
+        # Use 'spawn' context to avoid fork-related deadlocks with locks/file descriptors
+        ctx = mp.get_context('spawn')
+        with ctx.Pool(processes=self.NUM_PROCESSES) as pool:
             worker_fn = partial(
                 _parallel_worker_write,
                 out_path=str(parallel_output),
