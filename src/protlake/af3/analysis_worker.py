@@ -144,6 +144,13 @@ def _standardize_order_not_hetero(aa):
     aa[~aa.hetero] = aa[standardize_order(aa[~aa.hetero])]
     return aa
 
+def _build_file_index(root_dir):
+    index = {}
+    for root, dirs, files in os.walk(root_dir):
+        for name in files:
+            index.setdefault(name, []).append(os.path.join(root, name))
+    return index
+
 class staging_col_dict:
     def __init__(self):
         self.main_dict = {"id_hex":   {"val": [], "type": pa.string()}}
@@ -261,7 +268,13 @@ def main():
         # filter=pc.field("col_c") < 9,              # pushdown what you can
         batch_size=batch_size
     )
-    
+
+    print("Creating design file index for fast access...")
+    design_file_index_start = time.time()
+    design_file_index = _build_file_index(design_dir) # build file index to speed up access to design models
+    design_file_index_time = time.time() - design_file_index_start
+    print(f"Built design file index with {len(design_file_index)} entries in {design_file_index_time:.3f} sec")
+
     # process each batch
     for batch in scanner.to_batches():
         # initialize staging columns dict
@@ -287,8 +300,13 @@ def main():
             name = group_names[gi]
             rows = groups[gi]
             # read in design as atom array
-            design_path = os.path.join(design_dir, f"{name}.pdb")
-            aa_design = load_structure(design_path)
+            design_path = design_file_index.get(f"{name}.pdb", [None])
+            if design_path is None:
+                print(f"Warning: Design file for {name} not found in design directory, skipping")
+                continue
+            if len(design_path) > 1:
+                print(f"Warning: Multiple design files found for {name} in design directory, using first one found: {design_path[0]}")
+            aa_design = load_structure(design_path[0])
             # remove hydrogens which are not in af3 output anyway
             aa_design = aa_design[aa_design.element != "H"]
             # if ncaa specified, set those residues to non-hetero
