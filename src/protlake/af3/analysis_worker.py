@@ -11,7 +11,7 @@ from protlake.utils import (
     pread_bcif_to_atom_array, 
     pread_json_msgpack_to_dict
 )
-from biotite.structure import filter_peptide_backbone, superimpose, rmsd, AtomArray
+from biotite.structure import filter_amino_acids, superimpose, rmsd, AtomArray, get_residue_starts
 from biotite.structure.io import load_structure, save_structure
 from biotite.structure.info import standardize_order
 from xxhash import xxh64
@@ -23,13 +23,14 @@ import argparse
 from pathlib import Path
 from dataclasses import dataclass
 
+BB_ATOMS = np.array(["N", "CA", "C", "O"])
+
 @dataclass(frozen=True, slots=True)
 class ScoreFunctionInput:
     aa_design: AtomArray
     aa_af3: AtomArray
     meta: dict
     confidences: dict
-    sc_close_to_het_mask: np.ndarray
     CLI_args: argparse.Namespace
 
 def _import_plugin_module(path: Path):
@@ -144,6 +145,77 @@ def _standardize_order_not_hetero(aa):
     aa[~aa.hetero] = aa[standardize_order(aa[~aa.hetero])]
     return aa
 
+def _translate_residue_mask(aa1, aa2, mask_aa1): 
+    """
+    Translate an atom-level boolean mask from aa1 to aa2,
+    assuming both arrays have identical residue order.
+    
+    - Selects the exact same atoms (chain_id, res_id, atom_name) in aa2
+    - For residues where res_name differs, only backbone atoms are selectable
+    """
+    # Build set of selected atoms by (chain_id, res_id, atom_name)
+    selected_atoms = set(zip(
+        aa1.chain_id[mask_aa1], 
+        aa1.res_id[mask_aa1], 
+        aa1.atom_name[mask_aa1]
+    ))
+    
+    # Find residues where res_name differs between aa1 and aa2
+    # Build unique residue -> res_name maps
+    idx1 = get_residue_starts(aa1)
+    res_name_map_aa1 = {(aa1.chain_id[i], aa1.res_id[i]): aa1.res_name[i] for i in idx1}
+    
+    idx2 = get_residue_starts(aa2)
+    res_name_map_aa2 = {(aa2.chain_id[i], aa2.res_id[i]): aa2.res_name[i] for i in idx2}
+    
+    differing_residues = {
+        k for k in res_name_map_aa1 
+        if k in res_name_map_aa2 and res_name_map_aa1[k] != res_name_map_aa2[k]
+    }
+    
+    # Build mask for aa2: atom must be selected AND (residue matches OR is backbone)
+    mask_aa2 = np.array([
+        (c, r, atom) in selected_atoms and 
+        ((c, r) not in differing_residues or atom in BB_ATOMS)
+        for c, r, atom in zip(aa2.chain_id, aa2.res_id, aa2.atom_name)
+    ], dtype=bool)
+    
+    return mask_aa2
+
+
+def _filter_mask_common_residues(aa1, aa2, mask_aa1):
+    """
+    Filter a mask for aa1 to include only residues that are common between two arrays.
+    Or if mask_aa1 is None, return a mask selecting all residues of aa1 that are common between the two arrays.
+    """
+    res_id1, rep1 = np.unique(aa1.res_id, return_index=True)
+    res_id2, rep2 = np.unique(aa2.res_id, return_index=True)
+
+    name2_by_id = dict(zip(res_id2, aa2.res_name[rep2]))
+
+    same_res_ids = np.array([
+        rid for rid, i in zip(res_id1, rep1)
+        if name2_by_id.get(rid) == aa1.res_name[i]
+    ])
+
+    common = np.isin(aa1.res_id, same_res_ids)
+    backbone = np.isin(aa1.atom_name, BB_ATOMS)
+
+    if mask_aa1 is not None:
+        return mask_aa1 & (common | (~common & backbone))
+    else:
+        return common | (~common & backbone)
+
+def _get_sc_close_to_hetero_mask(aa_design):
+    aa_mask = filter_amino_acids(aa_design)
+    bb_mask = np.isin(aa_design.atom_name, BB_ATOMS) & aa_mask
+    close_to_het_mask = _expand_mask_to_residues(
+                _filter_atoms_close_to_hetero(aa_design, 7.5), 
+                aa_design
+            )
+    sc_close_to_het_mask = (close_to_het_mask & ~bb_mask)
+    return sc_close_to_het_mask
+
 def _build_file_index(root_dir):
     index = {}
     for root, dirs, files in os.walk(root_dir):
@@ -221,7 +293,9 @@ def main():
     parser.add_argument("--protlake-path", type=str, required=True, help="Path to the Protlake directory to analyze")
     parser.add_argument("--snapshot-ver", type=int, required=True, help="DeltaLake snapshot version to use")
     parser.add_argument("--staging-path", type=str, required=True, help="Path to the staging directory, default: <protlake-path>/delta_staging_table")
-    parser.add_argument("--design-dir", type=str, required=True, help="Path to the design directory")
+    parser.add_argument("--design-dir", type=str, required=False, help="Path to the design directory")
+    parser.add_argument("--design-pdb", type=str, required=False, help="Path to the design PDB file if single PDB is used instead of design directory.")
+    parser.add_argument("--seq-mismatch", action="store_true", help="Accept sequence mismatches between design and AF3 output.")
     parser.add_argument("--ncaa", type=str, nargs='+', required=False, help="List of NCAA 3-letter CCD codes.")
     parser.add_argument("--replace_lig_res_names", type=str, required=False, nargs="+", 
                         help="Residue names to replace in the AF3 output. " \
@@ -236,7 +310,6 @@ def main():
     execute_score_function_initializers(scorefxns, args)
     main_protlake_path = args.protlake_path
     snapshot_ver = args.snapshot_ver
-    design_dir = args.design_dir
     staging_path = args.staging_path
     replace_lig_res_names = args.replace_lig_res_names
     replace_lig_atom_names = args.replace_lig_atom_names
@@ -269,11 +342,12 @@ def main():
         batch_size=batch_size
     )
 
-    print("Creating design file index for fast access...")
-    design_file_index_start = time.time()
-    design_file_index = _build_file_index(design_dir) # build file index to speed up access to design models
-    design_file_index_time = time.time() - design_file_index_start
-    print(f"Built design file index with {len(design_file_index)} entries in {design_file_index_time:.3f} sec")
+    if args.design_dir is not None: # when not using single design PDB
+        print("Creating design file index for fast access...")
+        design_file_index_start = time.time()
+        design_file_index = _build_file_index(args.design_dir) # build file index to speed up access to design models
+        design_file_index_time = time.time() - design_file_index_start
+        print(f"Built design file index with {len(design_file_index)} entries in {design_file_index_time:.3f} sec")
 
     # process each batch
     for batch in scanner.to_batches():
@@ -300,13 +374,18 @@ def main():
             name = group_names[gi]
             rows = groups[gi]
             # read in design as atom array
-            design_path = design_file_index.get(f"{name}.pdb", [None])
-            if design_path is None:
-                print(f"Warning: Design file for {name} not found in design directory, skipping")
-                continue
-            if len(design_path) > 1:
-                print(f"Warning: Multiple design files found for {name} in design directory, using first one found: {design_path[0]}")
-            aa_design = load_structure(design_path[0])
+            if args.design_pdb is not None:
+                design_path = args.design_pdb
+            else: # when using design directory, look up design file path in index
+                design_path = design_file_index.get(f"{name}.pdb", [None])
+                if design_path is None:
+                    print(f"Warning: Design file for {name} not found in design directory, skipping")
+                    continue
+                if len(design_path) > 1:
+                    print(f"Warning: Multiple design files found for {name} in design directory, using first one found: {design_path[0]}")
+                    design_path = design_path[0]
+
+            aa_design = load_structure(design_path)
             # remove hydrogens which are not in af3 output anyway
             aa_design = aa_design[aa_design.element != "H"]
             # if ncaa specified, set those residues to non-hetero
@@ -318,13 +397,7 @@ def main():
             OXT_present_design = np.any(aa_design.atom_name == "OXT")
             # create bool selection masks
             aa_design_prot = aa_design[~aa_design.hetero]
-            CA_mask = (aa_design_prot.atom_name == "CA")
-            bb_mask = filter_peptide_backbone(aa_design_prot)
-            close_to_het_mask = _expand_mask_to_residues(
-                _filter_atoms_close_to_hetero(aa_design, 7.5), 
-                aa_design
-            )
-            sc_close_to_het_mask = (close_to_het_mask[~aa_design.hetero] & ~bb_mask)
+            sc_close_to_het_mask_design = _get_sc_close_to_hetero_mask(aa_design)
             for row in rows:
                 # ------------ import structure and meta data ------------
                 meta = batch.slice(row, 1).to_pylist()[0]
@@ -354,25 +427,42 @@ def main():
 
                 # remove OXT from AF3 output if not present in design model
                 aa_af3 = af3_array_setup(aa_af3, replace_lig_res_names, replace_lig_atom_names, OXT_present_design, confidences)
-                
-                # check that design and af3 have same atoms in same order for non-hetero atoms
                 aa_af3_prot = aa_af3[~aa_af3.hetero]
+                
+                # check for sequence mismatch between design and AF3 output
+                seq_mismatch = False
                 if aa_af3_prot.shape[0] != aa_design_prot.shape[0]:
-                    print(f"Warning: Different number of (non H) atoms in in design model and af3 prediction for {name}, sample {meta['sample']}, seed {meta['seed']}")
-                    continue
-                if not np.all(aa_af3_prot.atom_name == aa_design_prot.atom_name):
-                    print(f"Warning: Missmatch of atom names in in design model and af3 prediction for {name}, sample {meta['sample']}, seed {meta['seed']}")
-                    continue
+                    if not args.seq_mismatch:
+                        print(f"Warning: Different number of (non H) atoms in in design model and af3 prediction for {name}, sample {meta['sample']}, seed {meta['seed']}")
+                    seq_mismatch = True
+                if not np.array_equal(aa_af3_prot.atom_name, aa_design_prot.atom_name):
+                    if not args.seq_mismatch:
+                        print(f"Warning: Missmatch of atom names in in design model and af3 prediction for {name}, sample {meta['sample']}, seed {meta['seed']}")
+                    seq_mismatch = True
 
-                # first calculate transformation to align AF3 to design based on non-hetero CA atoms (to allow ligand differences)
+                if seq_mismatch:
+                    if not args.seq_mismatch:
+                        print("Skipping due to sequence mismatch (use --seq-mismatch to override)")
+                        continue
+                    else:
+                        sc_close_to_het_mask_af3 = _translate_residue_mask(aa_design, aa_af3, sc_close_to_het_mask_design)
+                        sc_close_to_het_mask_design_common = _filter_mask_common_residues(aa_design, aa_af3, sc_close_to_het_mask_design)
+                        sc_close_to_het_mask_af3_common = _filter_mask_common_residues(aa_af3, aa_design, sc_close_to_het_mask_af3)
+                        print(f"Sequence mismatch between design and AF3 output for {name}, sample {meta['sample']}, seed {meta['seed']}.\n" \
+                              f"  Only calculating side chain RMSDs for common residues.")
+                else:
+                    sc_close_to_het_mask_af3 = sc_close_to_het_mask_design
+                    sc_close_to_het_mask_design_common = sc_close_to_het_mask_design
+                    sc_close_to_het_mask_af3_common = sc_close_to_het_mask_design
+                
+                # calculate transformation to align AF3 to design based on non-hetero CA atoms
                 _, transformation = superimpose(
-                    aa_design_prot, 
-                    aa_af3_prot, 
-                    atom_mask=CA_mask
+                    aa_design_prot[aa_design_prot.atom_name == "CA"], 
+                    aa_af3_prot[aa_af3_prot.atom_name == "CA"]
                 )
                 # apply transformation to whole AF3 structure
                 aa_af3 = transformation.apply(aa_af3)
-                aa_af3_prot = aa_af3[~aa_af3.hetero] # also update protein-only view
+                aa_af3_prot = transformation.apply(aa_af3_prot)
 
                 # ------------ calculate base metrics ------------
                 staging_columns.append("id_hex", meta["id_hex"], pa.string())
@@ -383,34 +473,36 @@ def main():
                 pLDDT_AA = np.mean(confidences["atom_plddts"], dtype=np.float32)
                 staging_columns.append("pLDDT_AA", pLDDT_AA)
                 
-                RMSD_CA = rmsd(aa_design_prot[CA_mask], aa_af3_prot[CA_mask])
+                RMSD_CA = rmsd(aa_design_prot[aa_design_prot.atom_name == "CA"], aa_af3_prot[aa_af3_prot.atom_name == "CA"])
                 staging_columns.append("RMSD_CA", RMSD_CA)
 
-                RMSD_AA = rmsd_sc_automorphic(aa_design_prot, aa_af3_prot)
+                RMSD_AA = rmsd_sc_automorphic(
+                    aa_design_prot[_filter_mask_common_residues(aa_design_prot, aa_af3_prot, None)], 
+                    aa_af3_prot[_filter_mask_common_residues(aa_af3_prot, aa_design_prot, None)],
+                    ignore_missing_atom_pairs=args.seq_mismatch
+                )
                 staging_columns.append("RMSD_AA", RMSD_AA)
 
                 if any(aa_af3.hetero):
-                    pLDDT_SC_around_lig = np.mean(confidences["atom_plddts"][~aa_af3.hetero][sc_close_to_het_mask], dtype=np.float32)
+                    pLDDT_SC_around_lig = np.mean(confidences["atom_plddts"][sc_close_to_het_mask_af3], dtype=np.float32)
                     staging_columns.append("pLDDT_SC_around_lig", pLDDT_SC_around_lig)
                     
                     # before calculating RMSD_SC_around_lig, we align on that region
-                    aa_af3_temp, _ = superimpose(aa_design_prot, aa_af3_prot, atom_mask=sc_close_to_het_mask)
-                    RMSD_SC_around_lig = rmsd_sc_automorphic(aa_design_prot[sc_close_to_het_mask], aa_af3_temp[~aa_af3_temp.hetero][sc_close_to_het_mask])
+                    aa_af3_sc_close_to_het_common_temp, _ = superimpose(aa_design[sc_close_to_het_mask_design_common], aa_af3[sc_close_to_het_mask_af3_common])
+                    RMSD_SC_around_lig = rmsd_sc_automorphic(aa_design[sc_close_to_het_mask_design_common], aa_af3_sc_close_to_het_common_temp)
                     staging_columns.append("RMSD_SC_around_lig", RMSD_SC_around_lig)
-                    del aa_af3_temp
+                    del aa_af3_sc_close_to_het_common_temp
                     
                     pLDDT_LIGs = {k: np.mean(confidences["atom_plddts"][aa_af3.res_name == k], dtype=np.float32) for k in np.unique(aa_af3[aa_af3.hetero].res_name)}
                     for key, val in pLDDT_LIGs.items():
                         staging_columns.append(f"pLDDT_LIG_{key}", val)
                 
                 # ------------ calculate user defiend metrics ------------
-                # TODO: pass one input object instead of separate arguments
                 sfx_input = ScoreFunctionInput(
                     aa_design=aa_design,
                     aa_af3=aa_af3,
                     meta=meta,
                     confidences=confidences,
-                    sc_close_to_het_mask=sc_close_to_het_mask,
                     CLI_args=args
                 )
 

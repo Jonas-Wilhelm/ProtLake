@@ -23,7 +23,6 @@ def score(sfx_input: ScoreFunctionInput):
     #   aa_af3: biotite.structure.AtomArray of the af3 prediction
     #   meta: dict representation of the deltalake row that is currently processed (also contains all ..._summary_confidences.json data)
     #   confidences: dict that contains all information of the ..._confidences.json that af3 outputs
-    #   sc_close_to_het_mask: np.array bool mask to select all sidechains that are close to any ligand (hetero atoms)
     #   CLI_args: argparse.Namespace object with all parsed command line arguments 
 
     # Example:

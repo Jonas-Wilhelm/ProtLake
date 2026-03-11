@@ -13,10 +13,12 @@ def main():
     # Args only for the launcher
     parser.add_argument("--num-tasks", type=int, default=1,
                         help="Number of workers in the array")
-    parser.add_argument("--protlake-path", type=str, required=True, 
+    parser.add_argument("--protlake-path", type=str, required=False, 
                         help="Path to the Protlake directory to analyze")
     parser.add_argument("--design-dir", type=str, required=False, 
-                        help="Path to the design directory")
+                        help="Path to the design directory. (mutually exclusive with --design-pdb)")
+    parser.add_argument("--design-pdb", type=str, required=False,
+                        help="Path to the design PDB file if single PDB is used instead of design directory. (mutually exclusive with --design-dir)")
     parser.add_argument("--staging-path", type=str, required=False,
                         help="Path to the staging deltatable, default: <protlake-path>/delta_staging_table")
     parser.add_argument("--local", action="store_true", 
@@ -62,8 +64,14 @@ def main():
     # Submit array job
     # Flatten the tuple for --wrap into a single string
     if not launcher_args.merge_only:
-        if launcher_args.design_dir is None:
-            raise ValueError("Error: --design-dir argument is required when not using --merge-only mode")
+        if launcher_args.design_dir is None and launcher_args.design_pdb is None:
+            raise ValueError("Error: --design-dir or --design-pdb argument is required when not using --merge-only mode")
+        if launcher_args.design_dir is not None and launcher_args.design_pdb is not None:
+            raise ValueError("Error: --design-dir and --design-pdb arguments are mutually exclusive")
+        if launcher_args.design_dir is not None:
+            worker_args.extend(["--design-dir", launcher_args.design_dir])
+        if launcher_args.design_pdb is not None:
+            worker_args.extend(["--design-pdb", launcher_args.design_pdb])
 
         # Get current version of the delta table (only needed for worker jobs)
         _, delta_path = get_protlake_dirs(launcher_args.protlake_path)
@@ -74,7 +82,6 @@ def main():
         worker_cmd = (
             f"{launcher_args.python_bin} -m {worker_script} {' '.join(shlex.quote(a) for a in worker_args)} "
             f"--protlake-path {launcher_args.protlake_path} "
-            f"--design-dir {launcher_args.design_dir} "
             f"--staging-path {staging_path} "
             f"--snapshot-ver {snapshot_ver} "
         )
