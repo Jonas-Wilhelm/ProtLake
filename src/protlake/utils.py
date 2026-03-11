@@ -63,7 +63,7 @@ def _sq_euclidian(reference, subject):
     dif = subject_coord - reference_coord
     return vector_dot(dif, dif)
 
-def rmsd_sc_automorphic(reference, subject):
+def rmsd_sc_automorphic(reference, subject, ignore_missing_atom_pairs = False):
     """
     Compute the all-atom RMSD between two structures, accounting for
     symmetry in selected sidechain atoms (e.g., OD1/OD2 in ASP).
@@ -101,7 +101,10 @@ def rmsd_sc_automorphic(reference, subject):
             for atom_pair in atom_pairs:
                 # check if both atoms in pair are present
                 if not (np.any(reference[atom_idx].atom_name == atom_pair[0]) and np.any(reference[atom_idx].atom_name == atom_pair[1])):
-                    raise ValueError(f"Atom pair {atom_pair} not found in residue {res_name} for symmetry consideration.")
+                    if ignore_missing_atom_pairs:
+                        continue
+                    else:
+                        raise ValueError(f"Atom pair {atom_pair} not found in residue {res_name} for symmetry consideration.")
                 # swap their indices
                 idx_a = np.where(reference[atom_idx].atom_name == atom_pair[0])[0][0]
                 idx_b = np.where(reference[atom_idx].atom_name == atom_pair[1])[0][0]
