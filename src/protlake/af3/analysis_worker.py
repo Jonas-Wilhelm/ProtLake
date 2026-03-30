@@ -383,7 +383,8 @@ def main():
                     continue
                 if len(design_path) > 1:
                     print(f"Warning: Multiple design files found for {name} in design directory, using first one found: {design_path[0]}")
-                    design_path = design_path[0]
+                
+                design_path = design_path[0]
 
             aa_design = load_structure(design_path)
             # remove hydrogens which are not in af3 output anyway
