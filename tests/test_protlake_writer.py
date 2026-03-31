@@ -580,7 +580,7 @@ class TestProtlakeWriterDelete:
         assert protlake_writer.check_exists({"name": "test_single"})
         
         # Delete it
-        protlake_writer.delete("name = 'test_single'")
+        protlake_writer.delete({"name": "test_single"})
         
         # Verify it's gone
         assert not protlake_writer.check_exists({"name": "test_single"})
@@ -588,7 +588,7 @@ class TestProtlakeWriterDelete:
     def test_delete_nonexistent(self, protlake_writer):
         """Test deleting non-existent entries doesn't error."""
         # Should not raise
-        protlake_writer.delete("name = 'definitely_does_not_exist'")
+        protlake_writer.delete({"name": "definitely_does_not_exist"})
 
 
 class TestProtlakeWriterEdgeCases:

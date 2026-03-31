@@ -33,6 +33,7 @@ from protlake.write.core import (
     RetryConfig,
     LeaseMismatchRetry,
     load_delta_table_with_retries,
+    retry_with_backoff,
 )
 
 logger = logging.getLogger(__name__)
@@ -518,15 +519,37 @@ class ProtlakeWriter:
         scanner = pa_dataset.scanner(filter=filter_expr, columns=columns)
         return scanner.to_table()
     
-    def delete(self, predicate: str) -> None:
+    def delete(self, keys: Dict[str, Any]) -> None:
         """
-        Delete entries matching a predicate.
+        Delete entries matching the given key values.
         
         Args:
-            predicate: SQL-like predicate string, e.g. "name = 'test'"
+            keys: Dictionary of column-value pairs to match, e.g.:
+                  {"name": "test", "sample": 1}
         """
+        if not keys:
+            raise ValueError("keys dict must not be empty")
+        
         if not os.path.exists(os.path.join(self.delta_path, "_delta_log")):
             logger.info("Delta table does not exist yet; nothing to delete.")
             return
-        dt = DeltaTable(f"file://{os.path.abspath(self.delta_path)}")
-        dt.delete(predicate)
+        
+        # Build SQL predicate from dict
+        parts = []
+        for col, val in keys.items():
+            if isinstance(val, str):
+                escaped = val.replace("'", "''")
+                parts.append(f"{col} = '{escaped}'")
+            else:
+                parts.append(f"{col} = {val}")
+        predicate = " AND ".join(parts)
+        
+        dt = load_delta_table_with_retries(
+            delta_path=self.delta_path,
+            retry_config=self.cfg.retry_conf,
+        )
+        retry_with_backoff(
+            lambda: dt.delete(predicate),
+            self.cfg.retry_conf,
+            description="Deleting from delta table",
+        )
