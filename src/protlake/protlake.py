@@ -67,7 +67,7 @@ class ProtLake():
     def extract_cif(
         self,
         bcif_shard: str | list[str],
-        bcif_off: int | list[int],
+        bcif_data_off: int | list[int],
         bcif_len: int | list[int],
         file_names: str | list[str],
         out_dir: str,
@@ -83,20 +83,20 @@ class ProtLake():
         overwrite: bool = False,
         as_str: bool = False,
         df: pd.DataFrame,
-        append_seed_sample: bool = True,
+        file_name_cols: str | list[str] | None = None,
     ) -> None: ...
 
     def extract_cif(
         self,
         bcif_shard: Optional[str | list[str]] = None,
-        bcif_off: Optional[int | list[int]] = None,
+        bcif_data_off: Optional[int | list[int]] = None,
         bcif_len: Optional[int | list[int]] = None,
         file_names: Optional[str | list[str]] = None,
+        file_name_cols: Optional[str | list[str]] = None,
         out_dir: str = None,
         overwrite: bool = False,
         as_str: bool = False,
         df: Optional[pd.DataFrame] = None,
-        append_seed_sample: bool = True,
     ) -> None | str | list[str]:
         
         if out_dir is None and not as_str:
@@ -104,57 +104,78 @@ class ProtLake():
         
         if df is not None:
             # check that no other args are provided
-            if any(arg is not None for arg in (bcif_shard, bcif_off, bcif_len, file_names)):
-                raise ValueError("Pass either df OR explicit bcif_shard/off/len/file_names, not both.")
+            if any(arg is not None for arg in (bcif_shard, bcif_data_off, bcif_len, file_names)):
+                raise ValueError("Pass either df OR explicit bcif_shard/bcif_data_off/bcif_len/file_names, not both.")
             
             # check if df has all the required columns
-            required_cols = {'bcif_shard', 'bcif_data_off', 'bcif_len', 'name'}
-            if append_seed_sample:
-                required_cols.update({'seed', 'sample'})
+            required_cols = {'bcif_shard', 'bcif_data_off', 'bcif_len'}
             if not required_cols.issubset(df.columns):
                 raise ValueError(f"df must contain the following columns: {required_cols}")
             
             bcif_shard = df['bcif_shard'].tolist()
-            bcif_off = df['bcif_data_off'].tolist()
+            bcif_data_off = df['bcif_data_off'].tolist()
             bcif_len = df['bcif_len'].tolist()
-            if append_seed_sample:
-                file_names = [f"{name}_{seed}_{sample}" for name, seed, sample in zip(df['name'], df['seed'], df['sample'])]
-            else:
-                file_names = df['name'].tolist()
+            if file_name_cols is None:
+                file_name_cols = 'name'
+                print(
+                    "Warning: extract_cif() defaulted file_name_cols to 'name'. "
+                    "If 'name' is not unique, files may be overwritten or skipped. "
+                    "Specify file_name_cols to avoid this."
+                )
+            if isinstance(file_name_cols, str):
+                file_name_cols = [file_name_cols]
+            missing_name_cols = set(file_name_cols) - set(df.columns)
+            if missing_name_cols:
+                raise ValueError(f"df is missing file name columns: {missing_name_cols}")
+            file_names = (
+                df[file_name_cols]
+                .astype(str)
+                .agg('_'.join, axis=1)
+                .tolist()
+            )
         else:
-            if bcif_shard is None or bcif_off is None or bcif_len is None or file_names is None:
-                raise ValueError("Either df or all of bcif_shard, bcif_off, bcif_len, and file_names must be provided.")
+            if bcif_shard is None or bcif_data_off is None or bcif_len is None or file_names is None:
+                raise ValueError("Either df or all of bcif_shard, bcif_data_off, bcif_len, and file_names must be provided.")
             if isinstance(bcif_shard, str):
                 bcif_shard = [bcif_shard]
-            if isinstance(bcif_off, int):
-                bcif_off = [bcif_off]
+            if isinstance(bcif_data_off, int):
+                bcif_data_off = [bcif_data_off]
             if isinstance(bcif_len, int):
                 bcif_len = [bcif_len]
             if isinstance(file_names, str):
                 file_names = [file_names]
 
+        if file_name_cols is not None and df is None:
+            raise ValueError("file_name_cols can only be used when df is provided.")
+
+        if not as_str and file_names is None:
+            raise ValueError("file_names must be provided explicitly or derived from df via file_name_cols.")
+
         if not as_str:
             os.makedirs(out_dir, exist_ok=True)
+            for shard, offset, length, file_name in zip(bcif_shard, bcif_data_off, bcif_len, file_names):
+                shard_path = os.path.join(self.shard_path, str(shard))
+                if not file_name.endswith('.cif'):
+                    file_name += '.cif'
+                out_path = os.path.join(out_dir, file_name)
+                if os.path.exists(out_path) and not overwrite:
+                    print(f"File {out_path} exists, skipping...")
+                    continue
+                try:
+                    bcif_shard_to_mmCIF_file(shard_path, offset, length, out_path)
+                except Exception as e:
+                    print(f"Error reading {shard_path} at offset {offset} with length {length}: {e}")
+                    continue
         else:
             out_str_list = []
-
-        for shard, offset, length, file_name in zip(bcif_shard, bcif_off, bcif_len, file_names):
-            shard_path = os.path.join(self.shard_path, str(shard))
-            if not file_name.endswith('.cif'):
-                file_name += '.cif'
-            out_path = os.path.join(out_dir, file_name)
-            if os.path.exists(out_path) and not overwrite:
-                print(f"File {out_path} exists, skipping...")
-                continue
-            try:
-                if as_str:
+            for shard, offset, length in zip(bcif_shard, bcif_data_off, bcif_len):
+                shard_path = os.path.join(self.shard_path, str(shard))
+                try:
                     out_str = bcif_shard_to_mmCIF_str(shard_path, offset, length)
                     out_str_list.append(out_str)
-                else:
-                    bcif_shard_to_mmCIF_file(shard_path, offset, length, out_path)
-            except Exception as e:
-                print(f"Error reading {shard_path} at offset {offset} with length {length}: {e}")
-                continue
+                except Exception as e:
+                    print(f"Error reading {shard_path} at offset {offset} with length {length}: {e}")
+                    continue
 
         if as_str:
             # return list or if only one, return single string
