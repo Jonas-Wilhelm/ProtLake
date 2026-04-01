@@ -8,6 +8,7 @@ import pyarrow as pa
 import pyarrow.dataset as ds
 from biotite.structure.atoms import coord
 from biotite.structure.util import vector_dot
+from biotite.structure.io.pdb import PDBFile
 from biotite.structure.io.pdbx import (
     BinaryCIFFile, 
     get_structure, 
@@ -206,6 +207,29 @@ def cif_bytes_to_bcif_bytes(cif_data: bytes, rtol: float = 1e-6, atol: float = 1
     f = io.StringIO(cif_data.decode('utf-8'))
     cif = CIFFile.read(f)
     atom_array = get_structure(cif, extra_fields=['b_factor'], model=1)
+    bcif = BinaryCIFFile()
+    set_structure(bcif, atom_array)
+    bcif = compress(bcif, rtol=rtol, atol=atol)
+    buf = io.BytesIO()
+    bcif.write(buf)
+    return buf.getvalue()
+
+def pdb_bytes_to_bcif_bytes(pdb_data: bytes, rtol: float = 1e-6, atol: float = 1e-4) -> bytes:
+    """Convert PDB bytes to BinaryCIF bytes."""
+    pdb_file = PDBFile.read(io.StringIO(pdb_data.decode("utf-8")))
+    atom_array = pdb_file.get_structure(extra_fields=["b_factor"])
+
+    bcif = BinaryCIFFile()
+    set_structure(bcif, atom_array)
+    bcif = compress(bcif, rtol=rtol, atol=atol)
+
+    out = io.BytesIO()
+    bcif.write(out)
+    return out.getvalue()
+
+def pdb_to_bcif_bytes(pdb_path: str, rtol: float = 1e-6, atol: float = 1e-4) -> bytes:
+    """Convert a PDB file to BinaryCIF bytes."""
+    atom_array = load_structure(pdb_path, extra_fields=['b_factor'])
     bcif = BinaryCIFFile()
     set_structure(bcif, atom_array)
     bcif = compress(bcif, rtol=rtol, atol=atol)

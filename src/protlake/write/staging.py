@@ -15,9 +15,12 @@ Directory layout under ``protlake_dir``::
 import json
 import logging
 import os
+import shutil
+import time
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
+from .writer import ProtlakeWriter
 
 logger = logging.getLogger(__name__)
 
@@ -174,3 +177,107 @@ class StagingWriter:
             self._ready_dir,
         )
         return self._ready_dir
+
+
+class SpoolIngester:
+    """Ingest published staging batches from ``spool/ready`` into a ProtlakeWriter."""
+
+    def __init__(self, protlake_dir: str, writer: ProtlakeWriter, min_entries: int = 1):
+        _, ready_root = ensure_spool_dirs(protlake_dir)
+        self._ready_root = ready_root
+        self.writer = writer
+        self.min_entries = min_entries
+
+    def _list_ready_batches(self) -> List[str]:
+        batch_dirs = []
+        for name in os.listdir(self._ready_root):
+            path = os.path.join(self._ready_root, name)
+            if os.path.isdir(path):
+                batch_dirs.append(path)
+        return sorted(batch_dirs)
+
+    def _load_manifest(self, batch_dir: str) -> Dict[str, Any]:
+        manifest_path = os.path.join(batch_dir, "manifest.json")
+        with open(manifest_path, "r") as f:
+            return json.load(f)
+
+    def _total_ready_entries(self, batch_dirs: List[str]) -> int:
+        total = 0
+        for batch_dir in batch_dirs:
+            total += int(self._load_manifest(batch_dir).get("entry_count", 0))
+        return total
+
+    def _iter_group_ids(self, batch_dir: str) -> List[str]:
+        group_ids = []
+        for filename in os.listdir(batch_dir):
+            if filename.startswith("group-") and filename.endswith(".pdb"):
+                group_ids.append(filename[:-4])
+        return sorted(group_ids)
+
+    def _ingest_batch(self, batch_dir: str) -> int:
+        ingested = 0
+        for group_id in self._iter_group_ids(batch_dir):
+            pdb_path = os.path.join(batch_dir, f"{group_id}.pdb")
+            json_path = os.path.join(batch_dir, f"{group_id}.json")
+            heavy_path = os.path.join(batch_dir, f"{group_id}.heavy.json")
+
+            with open(json_path, "r") as f:
+                light_metadata = json.load(f)
+
+            heavy_metadata = None
+            if os.path.exists(heavy_path):
+                with open(heavy_path, "r") as f:
+                    heavy_metadata = json.load(f)
+
+            self.writer.write_pdb_file(
+                pdb_path=pdb_path,
+                light_metadata=light_metadata,
+                heavy_metadata=heavy_metadata,
+            )
+            ingested += 1
+
+        self.writer.flush()
+        shutil.rmtree(batch_dir)
+        return ingested
+
+    def run_once(self) -> Dict[str, int]:
+        batch_dirs = self._list_ready_batches()
+        if not batch_dirs:
+            return {"processed_batches": 0, "processed_entries": 0, "pending_entries": 0}
+
+        pending_entries = self._total_ready_entries(batch_dirs)
+        if pending_entries < self.min_entries:
+            logger.info(
+                "Skipping spool ingest: %d ready entries below min_entries=%d",
+                pending_entries,
+                self.min_entries,
+            )
+            return {"processed_batches": 0, "processed_entries": 0, "pending_entries": pending_entries}
+
+        processed_batches = 0
+        processed_entries = 0
+        for batch_dir in batch_dirs:
+            manifest = self._load_manifest(batch_dir)
+            logger.info(
+                "Ingesting staged batch %s with %s entries",
+                manifest.get("batch_id", os.path.basename(batch_dir)),
+                manifest.get("entry_count", "unknown"),
+            )
+            processed_entries += self._ingest_batch(batch_dir)
+            processed_batches += 1
+
+        return {
+            "processed_batches": processed_batches,
+            "processed_entries": processed_entries,
+            "pending_entries": 0,
+        }
+
+    def run_loop(self, interval_seconds: int) -> None:
+        while True:
+            result = self.run_once()
+            logger.info(
+                "Spool ingest sweep complete: %d batches, %d entries",
+                result["processed_batches"],
+                result["processed_entries"],
+            )
+            time.sleep(interval_seconds)

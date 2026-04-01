@@ -14,9 +14,11 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.dataset as ds
 from pathlib import Path
+import json
 
 import biotite.structure as struc
 import biotite.structure.io.pdbx as pdbx
+import biotite.structure.io.pdb as pdb
 
 from typing import List
 
@@ -99,6 +101,16 @@ def structure_to_cif_bytes(atoms: struc.AtomArray) -> bytes:
     buffer = io.StringIO()
     cif_file.write(buffer)
     return buffer.getvalue().encode("utf-8")
+
+
+def structure_to_pdb_string(atoms: struc.AtomArray) -> str:
+    """Convert an AtomArray to a PDB string."""
+    import io
+    pdb_file = pdb.PDBFile()
+    pdb.set_structure(pdb_file, atoms)
+    buffer = io.StringIO()
+    pdb_file.write(buffer)
+    return buffer.getvalue()
 
 
 def add_coordinate_noise(atoms: struc.AtomArray, noise_std: float, rng: np.random.Generator) -> struc.AtomArray:
@@ -324,6 +336,86 @@ class TestProtlakeWriterWrite:
         
         assert "id_hex" in result
         protlake_writer.flush()
+
+    def test_write_single_pdb_structure(self, protlake_writer, base_structure):
+        """Test writing a single structure from PDB text."""
+        pdb_string = structure_to_pdb_string(base_structure)
+
+        result = protlake_writer.write_pdb(
+            pdb_data=pdb_string,
+            light_metadata={
+                "name": "test_single_pdb",
+                "sample_idx": 1001,
+                "noise_seed": 0,
+                "rmsd_from_original": 0.0,
+                "atom_count": len(base_structure),
+            },
+            heavy_metadata={"source": "pdb"},
+        )
+
+        assert "id_hex" in result
+        assert len(result["id_hex"]) == 64
+        protlake_writer.flush()
+
+
+class TestSpoolIngester:
+    def test_schema_config_loader(self, tmp_path):
+        from protlake.write.schema_config import load_schema_config
+
+        schema_path = tmp_path / "schema.json"
+        schema_path.write_text(json.dumps({
+            "fields": [
+                {"name": "name", "type": "string"},
+                {"name": "sample_idx", "type": "int32", "nullable": False},
+                {"name": "score", "type": "float32"},
+            ]
+        }))
+
+        schema = load_schema_config(str(schema_path))
+        assert schema.names == ["name", "sample_idx", "score"]
+        assert schema.field("sample_idx").nullable is False
+
+    def test_spool_ingest_run_once(self, tmp_path, base_structure):
+        from protlake.write.staging import SpoolIngester, StagingWriter
+        from protlake.write.writer import ProtlakeWriter, ProtlakeWriterConfig
+
+        protlake_dir = tmp_path / "protlake"
+        writer = ProtlakeWriter(
+            ProtlakeWriterConfig(
+                out_path=str(protlake_dir),
+                user_schema=pa.schema([
+                    pa.field("name", pa.string()),
+                    pa.field("sample_idx", pa.int32()),
+                    pa.field("score", pa.float32()),
+                ]),
+                batch_size_metadata=10,
+                shard_size=10 * 1024 * 1024,
+                write_json_shards=True,
+                zstd_level=3,
+            )
+        )
+
+        staging = StagingWriter(str(protlake_dir))
+        pdb_string = structure_to_pdb_string(base_structure)
+        staging.add(pdb_string, {"name": "staged_a", "sample_idx": 0, "score": 0.5})
+        staging.add(
+            pdb_string,
+            {"name": "staged_b", "sample_idx": 1, "score": 1.5},
+            heavy_metadata={"pae": [[1.0]]},
+        )
+        ready_batch_dir = staging.publish()
+        assert ready_batch_dir is not None
+
+        ingester = SpoolIngester(str(protlake_dir), writer=writer, min_entries=2)
+        result = ingester.run_once()
+
+        assert result["processed_batches"] == 1
+        assert result["processed_entries"] == 2
+        assert not Path(ready_batch_dir).exists()
+
+        table = writer.query()
+        assert table.num_rows == 2
+        assert set(table.column("name").to_pylist()) == {"staged_a", "staged_b"}
 
 
 class TestProtlakeWriterWriteParallel:

@@ -26,7 +26,14 @@ import pyarrow.dataset as ds
 
 from deltalake import DeltaTable
 
-from protlake.utils import ensure_dirs, get_protlake_dirs, cif_to_bcif_bytes, cif_bytes_to_bcif_bytes
+from protlake.utils import (
+    ensure_dirs,
+    get_protlake_dirs,
+    cif_to_bcif_bytes,
+    cif_bytes_to_bcif_bytes,
+    pdb_to_bcif_bytes,
+    pdb_bytes_to_bcif_bytes,
+)
 from protlake.write.core import (
     ShardPackWriter,
     DeltaAppender,
@@ -239,6 +246,48 @@ class ProtlakeWriter:
             Dictionary with 'id_hex' and storage location info.
         """
         bcif_bytes = cif_to_bcif_bytes(cif_path, rtol=self.cfg.rtol, atol=self.cfg.atol)
+        return self.write_bcif(
+            bcif_bytes=bcif_bytes,
+            light_metadata=light_metadata,
+            heavy_metadata=heavy_metadata,
+            max_lease_retries=max_lease_retries,
+        )
+
+    def write_pdb(
+        self,
+        pdb_data: str | bytes,
+        light_metadata: Dict[str, Any],
+        heavy_metadata: Optional[Dict[str, Any]] = None,
+        max_lease_retries: int = 200,
+    ) -> Dict[str, Any]:
+        """
+        Write a PDB structure with metadata to Protlake.
+
+        The PDB payload is converted to BCIF internally.
+        """
+        if isinstance(pdb_data, str):
+            pdb_data = pdb_data.encode("utf-8")
+        bcif_bytes = pdb_bytes_to_bcif_bytes(pdb_data, rtol=self.cfg.rtol, atol=self.cfg.atol)
+        return self.write_bcif(
+            bcif_bytes=bcif_bytes,
+            light_metadata=light_metadata,
+            heavy_metadata=heavy_metadata,
+            max_lease_retries=max_lease_retries,
+        )
+
+    def write_pdb_file(
+        self,
+        pdb_path: str,
+        light_metadata: Dict[str, Any],
+        heavy_metadata: Optional[Dict[str, Any]] = None,
+        max_lease_retries: int = 200,
+    ) -> Dict[str, Any]:
+        """
+        Write a PDB file with metadata to Protlake.
+
+        The PDB file is converted to BCIF internally.
+        """
+        bcif_bytes = pdb_to_bcif_bytes(pdb_path, rtol=self.cfg.rtol, atol=self.cfg.atol)
         return self.write_bcif(
             bcif_bytes=bcif_bytes,
             light_metadata=light_metadata,
