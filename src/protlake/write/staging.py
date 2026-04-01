@@ -240,7 +240,7 @@ class SpoolIngester:
         shutil.rmtree(batch_dir)
         return ingested
 
-    def run_once(self) -> Dict[str, int]:
+    def run_once(self, run_maintenance=False) -> Dict[str, int]:
         batch_dirs = self._list_ready_batches()
         if not batch_dirs:
             return {"processed_batches": 0, "processed_entries": 0, "pending_entries": 0}
@@ -266,15 +266,20 @@ class SpoolIngester:
             processed_entries += self._ingest_batch(batch_dir)
             processed_batches += 1
 
+        if run_maintenance and processed_entries > 0:
+            t0 = time.time()
+            self.writer.maintenance()
+            print(f"DeltaTable maintenance completed in {time.time() - t0:.1f} seconds.")
+
         return {
             "processed_batches": processed_batches,
             "processed_entries": processed_entries,
             "pending_entries": 0,
         }
 
-    def run_loop(self, interval_seconds: int) -> None:
+    def run_loop(self, interval_seconds: int, run_maintenance=False) -> None:
         while True:
-            result = self.run_once()
+            result = self.run_once(run_maintenance=run_maintenance)
             logger.info(
                 "Spool ingest sweep complete: %d batches, %d entries",
                 result["processed_batches"],

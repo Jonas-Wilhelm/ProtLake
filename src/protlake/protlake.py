@@ -52,6 +52,7 @@ class ProtLake():
         return True
 
     def nrow(self) -> int:
+        self.load()
         self.n_row = DeltaTable_nrow(self.dt)
         return self.n_row
 
@@ -65,8 +66,8 @@ class ProtLake():
             retry_config=self.retry_conf,
         )
     
-    def maintenance(self, target_size = 1 << 28, max_concurrent_tasks=2, reload=False) -> bool:
-        deltatable_maintenance(self.dt, target_size=target_size, max_concurrent_tasks=max_concurrent_tasks)
+    def maintenance(self, target_size = 1 << 28, max_concurrent_tasks=2, retention_hours=0, reload=False) -> bool:
+        deltatable_maintenance(self.dt, target_size=target_size, max_concurrent_tasks=max_concurrent_tasks, retention_hours=retention_hours)
         if reload:
             self.load()
         return True

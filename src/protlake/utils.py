@@ -21,12 +21,17 @@ from biotite.structure.io import (
     load_structure
 )
 
-def deltatable_maintenance(dt, target_size = 1 << 28, max_concurrent_tasks=2):
+def deltatable_maintenance(dt, target_size = 1 << 28, max_concurrent_tasks=2, retention_hours=0):
     dt.alter.set_table_properties({"delta.logRetentionDuration": "interval 0 days"})
-    dt.optimize.z_order(["name"], target_size=target_size, max_concurrent_tasks=max_concurrent_tasks) # ~256 MB per file
-    # if too slow, just do compact instread of z_order, idea is to keep the names together
+    cols = dt.schema().to_arrow().names
+    if "name" in cols:
+        dt.optimize.z_order(["name"], target_size=target_size, max_concurrent_tasks=max_concurrent_tasks)
+    else:
+        print("Column 'name' not found in DeltaTable schema, not applying Z-ordering")
+        dt.optimize.compact(target_size=target_size, max_concurrent_tasks=max_concurrent_tasks)
+    # if z_order too slow, just do compact instread of z_order, idea is to keep the names together
     # dt.optimize.compact(target_size=target_size, max_concurrent_tasks=max_concurrent_tasks)
-    dt.vacuum(retention_hours=0, enforce_retention_duration=False, dry_run=False)
+    dt.vacuum(retention_hours=retention_hours, enforce_retention_duration=False, dry_run=False)
     dt.cleanup_metadata()
     dt.create_checkpoint()
 

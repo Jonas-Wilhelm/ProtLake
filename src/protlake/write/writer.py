@@ -28,6 +28,7 @@ from deltalake import DeltaTable
 
 from protlake.query import check_exists as delta_check_exists
 from protlake.utils import (
+    deltatable_maintenance,
     ensure_dirs,
     get_protlake_dirs,
     cif_to_bcif_bytes,
@@ -583,3 +584,11 @@ class ProtlakeWriter:
             self.cfg.retry_conf,
             description="Deleting from delta table",
         )
+
+    def maintenance(self, target_size = 1 << 28, max_concurrent_tasks=2, retention_hours=1) -> bool:
+        dt = load_delta_table_with_retries(
+            delta_path=self.delta_path,
+            retry_config=self.cfg.retry_conf,
+        )
+        deltatable_maintenance(dt, target_size=target_size, max_concurrent_tasks=max_concurrent_tasks, retention_hours=retention_hours)
+        return True

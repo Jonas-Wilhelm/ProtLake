@@ -1,4 +1,14 @@
 #!/usr/bin/env python3
+import os
+import sys
+
+_DEFAULT_RUST_LOG = "warn,deltalake_core::writer::stats=error" # to silence warnings about binrary fields
+
+# deltalake's Rust-side logger only picks this up reliably when the process
+# starts with RUST_LOG already in the environment, so re-exec once if needed.
+if "RUST_LOG" not in os.environ:
+    os.environ["RUST_LOG"] = _DEFAULT_RUST_LOG
+    os.execvpe(sys.executable, [sys.executable, *sys.argv], os.environ)
 
 import argparse
 import logging
@@ -54,13 +64,13 @@ def main():
     )
 
     if args.run_once:
-        result = ingester.run_once()
+        result = ingester.run_once(run_maintenance=True)
         logging.info("Processed %d batches and %d entries", result["processed_batches"], result["processed_entries"])
         writer.finalize()
         return
 
     try:
-        ingester.run_loop(interval_seconds=args.interval)
+        ingester.run_loop(interval_seconds=args.interval, run_maintenance=True)
     finally:
         writer.finalize()
 
