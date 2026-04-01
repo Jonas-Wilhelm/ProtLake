@@ -26,6 +26,7 @@ import pyarrow.dataset as ds
 
 from deltalake import DeltaTable
 
+from protlake.query import check_exists as delta_check_exists
 from protlake.utils import (
     ensure_dirs,
     get_protlake_dirs,
@@ -430,31 +431,11 @@ class ProtlakeWriter:
         Returns:
             True if at least one matching entry exists.
         """
-        if not keys:
-            raise ValueError("keys dict must not be empty")
-        
-        if not DeltaTable.is_deltatable(f"file://{os.path.abspath(self.delta_path)}"):
-            return False
-        
-        # Build filter expression from dict
-        filter_expr = None
-        for col, val in keys.items():
-            cond = ds.field(col) == val
-            filter_expr = cond if filter_expr is None else (filter_expr & cond)
-        
-        dt = load_delta_table_with_retries(
+        return delta_check_exists(
             delta_path=self.delta_path,
+            keys=keys,
             retry_config=self.cfg.retry_conf,
         )
-        
-        pa_dataset = dt.to_pyarrow_dataset()
-        # Use a minimal column to reduce I/O
-        scanner = pa_dataset.scanner(filter=filter_expr, columns=["id_hex"])
-        
-        for batch in scanner.to_batches():
-            if batch.num_rows > 0:
-                return True
-        return False
     
     def check_complete(
         self,

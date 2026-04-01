@@ -1,6 +1,7 @@
 import os
-from typing import overload, Optional
+from typing import Any, Dict, Optional, overload
 from deltalake import DeltaTable, write_deltalake
+from protlake.query import check_exists as delta_check_exists
 from protlake.utils import (
     DeltaTable_nrow, 
     deltatable_maintenance,
@@ -9,16 +10,18 @@ from protlake.utils import (
     pread_bcif_to_atom_array
 )
 from protlake.af3.ingest import CORE_SCHEMA
+from protlake.write.core import RetryConfig
 import pyarrow as pa
 import pandas as pd
 import numpy as np
 from biotite.structure import to_sequence
 
 class ProtLake():
-    def __init__(self, path, create=False):
+    def __init__(self, path, create=False, retry_conf: Optional[RetryConfig] = None):
         self.path = path
         self.delta_path = os.path.join(path, 'delta')
         self.shard_path = os.path.join(path, 'shards')
+        self.retry_conf = retry_conf if retry_conf is not None else RetryConfig()
         self.n_row = None
 
         self.dt = None
@@ -54,6 +57,13 @@ class ProtLake():
 
     def to_pandas(self) -> pd.DataFrame:
         return self.dt.to_pandas()
+
+    def check_exists(self, keys: Dict[str, Any]) -> bool:
+        return delta_check_exists(
+            delta_path=self.delta_path,
+            keys=keys,
+            retry_config=self.retry_conf,
+        )
     
     def maintenance(self, target_size = 1 << 28, max_concurrent_tasks=2, reload=False) -> bool:
         deltatable_maintenance(self.dt, target_size=target_size, max_concurrent_tasks=max_concurrent_tasks)
