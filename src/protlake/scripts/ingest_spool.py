@@ -9,12 +9,20 @@ from protlake.write.writer import ProtlakeWriter, ProtlakeWriterConfig
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Ingest staged spool batches into a Protlake")
+    parser = argparse.ArgumentParser(
+        description="Ingest staged spool batches into a Protlake",
+        epilog=(
+            "Schema config files must define a top-level 'fields' list. "
+            "Each field needs at least 'name' and 'type', with optional 'nullable'. "
+            "Example JSON/YAML: "
+            "{fields: [{name: name, type: string}, {name: sample_idx, type: int32, nullable: false}]}"
+        ),
+    )
     parser.add_argument("--protlake-path", type=str, required=True,
                         help="Path to the Protlake directory")
     parser.add_argument("--schema-config", type=str, required=True,
-                        help="Path to the JSON schema config for light metadata")
-    parser.add_argument("--interval", type=int, default=300,
+                        help="Path to the JSON or YAML schema config for light metadata; expected format is a top-level 'fields' list with entries like {name: ..., type: ..., nullable: ...}")
+    parser.add_argument("--interval", type=int, default=60,
                         help="Polling interval in seconds for continuous ingest mode")
     parser.add_argument("--min-entries", type=int, default=1,
                         help="Minimum number of ready staged entries before ingesting")

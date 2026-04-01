@@ -362,18 +362,36 @@ class TestSpoolIngester:
     def test_schema_config_loader(self, tmp_path):
         from protlake.write.schema_config import load_schema_config
 
-        schema_path = tmp_path / "schema.json"
-        schema_path.write_text(json.dumps({
+        payload = {
             "fields": [
                 {"name": "name", "type": "string"},
                 {"name": "sample_idx", "type": "int32", "nullable": False},
                 {"name": "score", "type": "float32"},
             ]
-        }))
+        }
+
+        schema_path = tmp_path / "schema.json"
+        schema_path.write_text(json.dumps(payload))
 
         schema = load_schema_config(str(schema_path))
         assert schema.names == ["name", "sample_idx", "score"]
         assert schema.field("sample_idx").nullable is False
+
+        yaml_path = tmp_path / "schema.yaml"
+        yaml_path.write_text(
+            "fields:\n"
+            "  - name: name\n"
+            "    type: string\n"
+            "  - name: sample_idx\n"
+            "    type: int32\n"
+            "    nullable: false\n"
+            "  - name: score\n"
+            "    type: float32\n"
+        )
+
+        yaml_schema = load_schema_config(str(yaml_path))
+        assert yaml_schema.names == ["name", "sample_idx", "score"]
+        assert yaml_schema.field("sample_idx").nullable is False
 
     def test_spool_ingest_run_once(self, tmp_path, base_structure):
         from protlake.write.staging import SpoolIngester, StagingWriter

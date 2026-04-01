@@ -1,13 +1,15 @@
 """
-Helpers for loading a user schema from a JSON config file.
+Helpers for loading a user schema from a JSON or YAML config file.
 """
 
 from __future__ import annotations
 
 import json
+import os
 from typing import Any, Dict
 
 import pyarrow as pa
+import yaml
 
 
 _PRIMITIVE_TYPES: Dict[str, pa.DataType] = {
@@ -63,10 +65,16 @@ def _parse_field(field_cfg: Dict[str, Any]) -> pa.Field:
 
 def load_schema_config(path: str) -> pa.Schema:
     with open(path, "r") as f:
-        payload = json.load(f)
+        suffix = os.path.splitext(path)[1].lower()
+        if suffix == ".json":
+            payload = json.load(f)
+        elif suffix in {".yaml", ".yml"}:
+            payload = yaml.safe_load(f)
+        else:
+            raise ValueError("Schema config must use a .json, .yaml, or .yml extension")
 
     if not isinstance(payload, dict) or "fields" not in payload:
-        raise ValueError("Schema config must be a JSON object with a 'fields' list")
+        raise ValueError("Schema config must be an object with a 'fields' list")
     if not isinstance(payload["fields"], list) or not payload["fields"]:
         raise ValueError("Schema config 'fields' must be a non-empty list")
 
