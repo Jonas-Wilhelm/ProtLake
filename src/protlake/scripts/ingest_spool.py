@@ -22,18 +22,18 @@ def main():
                         help="Path to the Protlake directory")
     parser.add_argument("--schema-config", type=str, required=True,
                         help="Path to the JSON or YAML schema config for light metadata; expected format is a top-level 'fields' list with entries like {name: ..., type: ..., nullable: ...}")
-    parser.add_argument("--interval", type=int, default=60,
-                        help="Polling interval in seconds for continuous ingest mode")
+    parser.add_argument("--interval", type=int, default=600,
+                        help="Polling interval in seconds for continuous ingest mode. (default: 600)")
     parser.add_argument("--min-entries", type=int, default=1,
-                        help="Minimum number of ready staged entries before ingesting")
+                        help="Minimum number of ready staged entries before ingesting. (default: 1)")
     parser.add_argument("--run-once", action="store_true",
                         help="Process one sweep and exit instead of polling forever")
-    parser.add_argument("--batch-size-metadata", type=int, default=2500,
-                        help="Metadata row flush batch size for the Protlake writer")
+    parser.add_argument("--batch-size-metadata", type=int, default=1000,
+                        help="Metadata row flush batch size for the Protlake writer. (default: 1000)")
     parser.add_argument("--shard-size", type=int, default=1 << 30,
-                        help="Target maximum shard size in bytes")
+                        help="Target maximum shard size in bytes. (default: 1 << 30)")
     parser.add_argument("--log-level", type=str, default="INFO",
-                        help="Python logging level")
+                        help="Python logging level. (default: INFO)")
     args = parser.parse_args()
 
     logging.basicConfig(level=getattr(logging, args.log_level.upper(), logging.INFO))
