@@ -1,0 +1,61 @@
+#!/usr/bin/env python3
+
+import argparse
+import logging
+
+from protlake.write.schema_config import load_schema_config
+from protlake.write.staging import SpoolIngester
+from protlake.write.writer import ProtlakeWriter, ProtlakeWriterConfig
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Ingest staged spool batches into a Protlake")
+    parser.add_argument("--protlake-path", type=str, required=True,
+                        help="Path to the Protlake directory")
+    parser.add_argument("--schema-config", type=str, required=True,
+                        help="Path to the JSON schema config for light metadata")
+    parser.add_argument("--interval", type=int, default=300,
+                        help="Polling interval in seconds for continuous ingest mode")
+    parser.add_argument("--min-entries", type=int, default=1,
+                        help="Minimum number of ready staged entries before ingesting")
+    parser.add_argument("--run-once", action="store_true",
+                        help="Process one sweep and exit instead of polling forever")
+    parser.add_argument("--batch-size-metadata", type=int, default=2500,
+                        help="Metadata row flush batch size for the Protlake writer")
+    parser.add_argument("--shard-size", type=int, default=1 << 30,
+                        help="Target maximum shard size in bytes")
+    parser.add_argument("--log-level", type=str, default="INFO",
+                        help="Python logging level")
+    args = parser.parse_args()
+
+    logging.basicConfig(level=getattr(logging, args.log_level.upper(), logging.INFO))
+
+    user_schema = load_schema_config(args.schema_config)
+    writer = ProtlakeWriter(
+        ProtlakeWriterConfig(
+            out_path=args.protlake_path,
+            user_schema=user_schema,
+            batch_size_metadata=args.batch_size_metadata,
+            shard_size=args.shard_size,
+        )
+    )
+    ingester = SpoolIngester(
+        protlake_dir=args.protlake_path,
+        writer=writer,
+        min_entries=args.min_entries,
+    )
+
+    if args.run_once:
+        result = ingester.run_once()
+        logging.info("Processed %d batches and %d entries", result["processed_batches"], result["processed_entries"])
+        writer.finalize()
+        return
+
+    try:
+        ingester.run_loop(interval_seconds=args.interval)
+    finally:
+        writer.finalize()
+
+
+if __name__ == "__main__":
+    main()
