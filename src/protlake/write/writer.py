@@ -107,6 +107,8 @@ class ProtlakeWriterConfig:
     # CIF->BCIF conversion tolerances (used when accepting CIF input)
     rtol: float = 1e-6
     atol: float = 1e-4
+    # Optional: custom serializer for light metadata before writing to Delta table
+    light_serializer: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None
     # Optional: custom serializer for heavy metadata before msgpack
     heavy_serializer: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None
     # Zstd compression level for heavy metadata
@@ -396,6 +398,8 @@ class ProtlakeWriter:
                 })
         
         # Merge core data with light metadata
+        if self.cfg.light_serializer is not None:
+            light_metadata = self.cfg.light_serializer(light_metadata)
         delta_row = {**core_data, **light_metadata}
         self.delta_appender.add_row(delta_row)
         
