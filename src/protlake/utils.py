@@ -8,6 +8,7 @@ import pyarrow as pa
 import pyarrow.dataset as ds
 from biotite.structure.atoms import coord
 from biotite.structure.util import vector_dot
+from biotite.structure.io.pdb import PDBFile
 from biotite.structure.io.pdbx import (
     BinaryCIFFile, 
     get_structure, 
@@ -20,12 +21,17 @@ from biotite.structure.io import (
     load_structure
 )
 
-def deltatable_maintenance(dt, target_size = 1 << 28, max_concurrent_tasks=2):
+def deltatable_maintenance(dt, target_size = 1 << 28, max_concurrent_tasks=2, retention_hours=0):
     dt.alter.set_table_properties({"delta.logRetentionDuration": "interval 0 days"})
-    dt.optimize.z_order(["name"], target_size=target_size, max_concurrent_tasks=max_concurrent_tasks) # ~256 MB per file
-    # if too slow, just do compact instread of z_order, idea is to keep the names together
+    cols = dt.schema().to_arrow().names
+    if "name" in cols:
+        dt.optimize.z_order(["name"], target_size=target_size, max_concurrent_tasks=max_concurrent_tasks)
+    else:
+        print("Column 'name' not found in DeltaTable schema, not applying Z-ordering")
+        dt.optimize.compact(target_size=target_size, max_concurrent_tasks=max_concurrent_tasks)
+    # if z_order too slow, just do compact instread of z_order, idea is to keep the names together
     # dt.optimize.compact(target_size=target_size, max_concurrent_tasks=max_concurrent_tasks)
-    dt.vacuum(retention_hours=0, enforce_retention_duration=False, dry_run=False)
+    dt.vacuum(retention_hours=retention_hours, enforce_retention_duration=False, dry_run=False)
     dt.cleanup_metadata()
     dt.create_checkpoint()
 
@@ -213,6 +219,29 @@ def cif_bytes_to_bcif_bytes(cif_data: bytes, rtol: float = 1e-6, atol: float = 1
     bcif.write(buf)
     return buf.getvalue()
 
+def pdb_bytes_to_bcif_bytes(pdb_data: bytes, rtol: float = 1e-6, atol: float = 1e-4) -> bytes:
+    """Convert PDB bytes to BinaryCIF bytes."""
+    pdb_file = PDBFile.read(io.StringIO(pdb_data.decode("utf-8")))
+    atom_array = pdb_file.get_structure(extra_fields=["b_factor"])
+
+    bcif = BinaryCIFFile()
+    set_structure(bcif, atom_array)
+    bcif = compress(bcif, rtol=rtol, atol=atol)
+
+    out = io.BytesIO()
+    bcif.write(out)
+    return out.getvalue()
+
+def pdb_to_bcif_bytes(pdb_path: str, rtol: float = 1e-6, atol: float = 1e-4) -> bytes:
+    """Convert a PDB file to BinaryCIF bytes."""
+    atom_array = load_structure(pdb_path, extra_fields=['b_factor'])
+    bcif = BinaryCIFFile()
+    set_structure(bcif, atom_array)
+    bcif = compress(bcif, rtol=rtol, atol=atol)
+    buf = io.BytesIO()
+    bcif.write(buf)
+    return buf.getvalue()
+
 # def get_row_from_deltalake_simple(dt, row_dict):
 #     ''' Get a single row from a Delta Lake table matching the criteria in row_dict'''
 #     dataset = dt.to_pyarrow_dataset()
@@ -281,3 +310,18 @@ def dump_random_cif_from_deltalake(dt, out_path='dump.cif', shard_dir=None):
             save_structure(out_path, atom_array)
             return True
     raise ValueError("No rows found in Delta Lake table")
+
+
+def is_retryable_delta_error(e: Exception) -> bool:
+    """
+    Only retry known concurrency conflicts
+    (most concurrency conflicts are retried internally by deltalake)
+    """
+    msg = str(e).lower()
+    retryable_phrases = [
+        "version 0 already exists",
+        "table metadata is invalid: number of checkpoint files", # '0' is not equal to number of checkpoint metadata parts 'None'
+        "generic deltatable error: non-contiguous log segment",
+        "failed to commit transaction"
+    ]
+    return any(phrase in msg for phrase in retryable_phrases)

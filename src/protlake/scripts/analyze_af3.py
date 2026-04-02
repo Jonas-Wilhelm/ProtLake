@@ -61,11 +61,6 @@ def main():
     worker_script = "protlake.af3.analysis_worker"
     merge_script = "protlake.af3.analysis_merge"
 
-    # Get current version of the delta table
-    _, delta_path = get_protlake_dirs(launcher_args.protlake_path)
-    dt = DeltaTable(f"file://{os.path.abspath(delta_path)}")
-    snapshot_ver = dt.version()
-
     # Submit array job
     # Flatten the tuple for --wrap into a single string
     if not launcher_args.merge_only:
@@ -77,6 +72,12 @@ def main():
             worker_args.extend(["--design-dir", launcher_args.design_dir])
         if launcher_args.design_pdb is not None:
             worker_args.extend(["--design-pdb", launcher_args.design_pdb])
+
+        # Get current version of the delta table (only needed for worker jobs)
+        _, delta_path = get_protlake_dirs(launcher_args.protlake_path)
+        dt = DeltaTable(f"file://{os.path.abspath(delta_path)}")
+        snapshot_ver = dt.version()
+        del dt  # Explicitly release to avoid hanging on cleanup
 
         worker_cmd = (
             f"{launcher_args.python_bin} -m {worker_script} {' '.join(shlex.quote(a) for a in worker_args)} "
