@@ -9,7 +9,7 @@ from protlake.utils import (
     bcif_shard_to_mmCIF_str,
     pread_bcif_to_atom_array
 )
-from protlake.af3.ingest import CORE_SCHEMA
+from protlake.write.writer import get_core_schema_fields
 from protlake.write.core import RetryConfig
 import pyarrow as pa
 import pandas as pd
@@ -38,7 +38,7 @@ class ProtLake():
                 os.makedirs(self.delta_path, exist_ok=True)
                 os.makedirs(self.shard_path, exist_ok=True)
                 empty = pa.table(
-                    {f.name: pa.array([], type=f.type) for f in CORE_SCHEMA}
+                    {f.name: pa.array([], type=f.type) for f in get_core_schema_fields()}
                 )
                 write_deltalake(
                     f"file://{os.path.abspath(self.delta_path)}",
