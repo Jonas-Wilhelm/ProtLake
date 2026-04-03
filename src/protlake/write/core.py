@@ -80,6 +80,7 @@ class ShardPackWriter:
         self.claim_ttl = claim_ttl
         self._current_shard: Optional[str] = None
         self._process_id = f"{gethostname()}:{os.getpid()}"  # for debug output
+        self._buffer: List[Tuple[bytes, bytes]] = []  # buffered (payload, rec_id) pairs
 
         # only keep claim bookkeeping if user enabled claims
         if self.use_claims:
@@ -438,94 +439,141 @@ class ShardPackWriter:
             logger.debug(f"[{self._process_id}] choose_shard: all candidates failed, restarting scan")
             time.sleep(random.uniform(0.1, 1.0))
 
-    # ---------- append ----------
-    def append(self, shard_path: str, payload: bytes, rec_id: Optional[bytes] = None) -> PackRecord:
-        """Append a PACK record. With claims enabled, verify our lease matches on disk."""
-        shard_path = os.path.realpath(shard_path)
+    # ---------- buffer / append / flush ----------
+    def append(self, payload: bytes, rec_id: Optional[bytes] = None) -> bytes:
+        """Buffer a PACK record for later flushing.
+
+        No shard selection, file I/O, or claiming happens here.
+        The caller (e.g. ProtlakeWriter) is responsible for triggering
+        flush() when the buffer reaches the desired batch size.
+
+        Returns:
+            The record id (bytes), computed as sha256(payload) when *rec_id* is None.
+        """
         if rec_id is None:
             rec_id = hashlib.sha256(payload).digest()
-        id_hex = rec_id.hex()
+        self._buffer.append((payload, rec_id))
+        return rec_id
 
-        id_len = len(rec_id)
-        data_len = len(payload)
-        hdr = (MAGIC + bytes([VERSION]) +
-               id_len.to_bytes(2, "big") +
-               data_len.to_bytes(4, "big"))
-        crc = (zlib.crc32(payload) & 0xFFFFFFFF).to_bytes(4, "big")
-        record = b"".join([hdr, rec_id, payload, crc])
+    def buffer_len(self) -> int:
+        """Return the number of buffered records not yet flushed."""
+        return len(self._buffer)
 
-        # Authoritative lease validation
-        claim_dir = self._claim_dir(shard_path) if self.use_claims else None
-        if self.use_claims:
-            lease_id = self._owned_claims.get(claim_dir or "")
-            claim_exists = claim_dir and os.path.exists(claim_dir)
-            meta = self._read_claim_meta(claim_dir) if claim_exists else None
-            
-            logger.debug(f"[{self._process_id}] append: shard={os.path.basename(shard_path)} claim_exists={claim_exists} in_memory_lease={lease_id[:12] if lease_id else None}... disk_meta={meta}")
-            
-            if not (lease_id and meta and meta.get("lease_id") == lease_id):
-                # Log warning with detailed diagnostics instead of raising RuntimeError
-                logger.warning(
-                    f"[{self._process_id}] LEASE MISMATCH - will retry with new shard. "
-                    f"shard_path={shard_path}, claim_dir={claim_dir}, claim_exists={claim_exists}, "
-                    f"in_memory_lease={lease_id}, disk_lease={meta.get('lease_id') if meta else None}"
+    def flush(self) -> List[PackRecord]:
+        """Write all buffered records to shard files.
+
+        Chooses a shard (claiming if enabled), writes all buffered records
+        under a single flock + single fsync per shard, and returns the
+        corresponding PackRecord list.
+
+        If the current shard fills up mid-batch it is released and a new
+        shard is chosen for the remaining records.
+
+        Raises:
+            LeaseMismatchRetry: if claim ownership is lost before writing.
+        """
+        if not self._buffer:
+            return []
+
+        results: List[PackRecord] = []
+        idx = 0
+
+        while idx < len(self._buffer):
+            shard_path = self.choose_shard()
+
+            # --- Authoritative lease validation before I/O ---
+            claim_dir = self._claim_dir(shard_path) if self.use_claims else None
+            if self.use_claims:
+                lease_id = self._owned_claims.get(claim_dir or "")
+                claim_exists = claim_dir and os.path.exists(claim_dir)
+                meta = self._read_claim_meta(claim_dir) if claim_exists else None
+
+                logger.debug(
+                    f"[{self._process_id}] flush: shard={os.path.basename(shard_path)} "
+                    f"claim_exists={claim_exists} "
+                    f"in_memory_lease={lease_id[:12] if lease_id else None}... "
+                    f"disk_meta={meta}"
                 )
-                logger.debug(f"[{self._process_id}] LEASE MISMATCH DETAILS:")
-                logger.debug(f"  shard_path: {shard_path}")
-                logger.debug(f"  claim_dir: {claim_dir}")
-                logger.debug(f"  claim_dir_exists: {claim_exists}")
-                logger.debug(f"  in_memory_lease_id: {lease_id}")
-                logger.debug(f"  disk_meta: {meta}")
-                logger.debug(f"  _owned_claims keys: {list(self._owned_claims.keys())}")
-                logger.debug(f"  _current_shard: {self._current_shard}")
-                # Try to get fresh stat info
-                if claim_dir:
-                    try:
-                        stat_info = os.stat(claim_dir)
-                        logger.debug(f"  claim_dir stat: mtime={stat_info.st_mtime} ({time.time() - stat_info.st_mtime:.1f}s ago)")
-                    except Exception as e:
-                        logger.debug(f"  claim_dir stat failed: {e}")
-                
-                # Clear state so caller can retry with a new shard
+
+                if not (lease_id and meta and meta.get("lease_id") == lease_id):
+                    logger.warning(
+                        f"[{self._process_id}] LEASE MISMATCH during flush - will retry with new shard. "
+                        f"shard_path={shard_path}, claim_dir={claim_dir}, claim_exists={claim_exists}, "
+                        f"in_memory_lease={lease_id}, disk_lease={meta.get('lease_id') if meta else None}"
+                    )
+                    self._current_shard = None
+                    if claim_dir:
+                        self._owned_claims.pop(claim_dir, None)
+                    raise LeaseMismatchRetry(
+                        f"Shard {shard_path} lease lost (stolen by another process). Retry with new shard."
+                    )
+
+            # --- Write buffered records under a single flock + fsync ---
+            fd = os.open(shard_path, os.O_CREAT | os.O_RDWR, 0o644)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX)
+                off = os.lseek(fd, 0, os.SEEK_END)
+
+                while idx < len(self._buffer):
+                    payload, rec_id = self._buffer[idx]
+                    id_hex = rec_id.hex()
+                    id_len = len(rec_id)
+                    data_len = len(payload)
+                    hdr = (MAGIC + bytes([VERSION]) +
+                           id_len.to_bytes(2, "big") +
+                           data_len.to_bytes(4, "big"))
+                    crc = (zlib.crc32(payload) & 0xFFFFFFFF).to_bytes(4, "big")
+                    record = b"".join([hdr, rec_id, payload, crc])
+
+                    os.pwrite(fd, record, off)
+                    data_off = off + len(hdr) + id_len
+
+                    results.append({
+                        "id_hex": id_hex,
+                        "id_bytes": rec_id,
+                        "off": off,
+                        "data_off": data_off,
+                        "length": data_len,
+                        "shard_path": os.path.basename(shard_path),
+                    })
+
+                    off += len(record)
+                    idx += 1
+
+                    # If the shard is now full, break to pick a new one
+                    if off >= self.max_bytes:
+                        break
+
+                try:
+                    os.fsync(fd)  # single fsync for the whole batch
+                except Exception:
+                    pass
+            finally:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+                os.close(fd)
+
+            # Heartbeat claim after successful write
+            if self.use_claims and claim_dir:
+                try:
+                    os.utime(claim_dir, None)
+                except Exception:
+                    pass
+
+            # If shard is full, release it so next iteration picks a new one
+            if off >= self.max_bytes:
+                self.release_shard(shard_path)
                 self._current_shard = None
-                if claim_dir:
-                    self._owned_claims.pop(claim_dir, None)
-                
-                raise LeaseMismatchRetry(
-                    f"Shard {shard_path} lease lost (stolen by another process). Retry with new shard."
-                )
 
-        fd = os.open(shard_path, os.O_CREAT | os.O_RDWR, 0o644)
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX)
-            off = os.lseek(fd, 0, os.SEEK_END)
-            os.pwrite(fd, record, off)
-            try:
-                os.fsync(fd)   # ensure the record is pushed to server/disk
-            except Exception:
-                pass
-            data_off = off + len(hdr) + id_len
-        finally:
-            fcntl.flock(fd, fcntl.LOCK_UN)
-            os.close(fd)
-
-        if self.use_claims:
-            # heartbeat after successful write (keeps TTL fresh on dir mtime)
-            try:
-                os.utime(claim_dir, None)  # heartbeat
-            except Exception:
-                pass
-
-        return {"id_hex": id_hex, "id_bytes": rec_id, "off": off, "data_off": data_off, "length": data_len, "shard_path": os.path.basename(shard_path)}
+        self._buffer.clear()
+        return results
 
 # --------------- Delta appenders ---------------
 class DeltaAppender:
     """Buffer rows per schema and flush to a Delta table via deltalake."""
-    def __init__(self, table_path: str, schema: pa.Schema, batch_size: int = 2500, retry_config: Optional[RetryConfig] = None):
+    def __init__(self, table_path: str, schema: pa.Schema, retry_config: Optional[RetryConfig] = None):
         self.retry_config = retry_config if retry_config is not None else RetryConfig()
         self.table_uri = f"file://{os.path.abspath(table_path)}"
         self.schema = schema
-        self.batch_size = batch_size
         self.buf: Dict[str, List[Any]] = {f.name: [] for f in schema}
 
         self.retry_config = retry_config
@@ -537,8 +585,6 @@ class DeltaAppender:
         # Strictly adhere to schema fields; missing fields become None
         for f in self.schema:
             self.buf[f.name].append(row.get(f.name))
-        if len(self.buf[self.schema[0].name]) >= self.batch_size:
-            self.flush()
 
     def flush(self) -> None:
         if not self.buf[self.schema[0].name]:

@@ -96,7 +96,7 @@ class ProtlakeWriterConfig:
     """Configuration for ProtlakeWriter."""
     out_path: str
     user_schema: pa.Schema
-    batch_size_metadata: int = 2500
+    batch_size: int = 100  # buffer threshold for shard record batching
     shard_size: int = 1 << 30  # 1 GB default
     bcif_shard_prefix: str = "bcif-pack"
     json_shard_prefix: str = "json-pack"
@@ -181,12 +181,15 @@ class ProtlakeWriter:
         self.delta_appender = DeltaAppender(
             self.delta_path,
             self.full_schema,
-            batch_size=cfg.batch_size_metadata,
             retry_config=cfg.retry_conf,
         )
         
         # Compression context (reusable)
         self._zstd_compressor = zstd.ZstdCompressor(level=cfg.zstd_level)
+        
+        # Pending light-metadata rows awaiting shard flush
+        # Each entry is (serialized_light_metadata_dict, has_json_payload)
+        self._pending: List[Tuple[Dict[str, Any], bool]] = []
         
         # Suppress biotite warnings about missing auth_*_id attributes
         warnings.filterwarnings(
@@ -204,7 +207,6 @@ class ProtlakeWriter:
         cif_bytes: bytes,
         light_metadata: Dict[str, Any],
         heavy_metadata: Optional[Dict[str, Any]] = None,
-        max_lease_retries: int = 200,
     ) -> Dict[str, Any]:
         """
         Write a CIF structure with metadata to Protlake.
@@ -215,7 +217,6 @@ class ProtlakeWriter:
             cif_bytes: Raw CIF file content as bytes.
             light_metadata: Dictionary of user-defined fields matching user_schema.
             heavy_metadata: Optional heavy metadata for JSON shard (if write_json_shards=True).
-            max_lease_retries: Maximum retries on lease mismatch (concurrent write conflicts).
         
         Returns:
             Dictionary with 'id_hex' and storage location info.
@@ -225,7 +226,6 @@ class ProtlakeWriter:
             bcif_bytes=bcif_bytes,
             light_metadata=light_metadata,
             heavy_metadata=heavy_metadata,
-            max_lease_retries=max_lease_retries,
         )
     
     def write_cif_file(
@@ -233,7 +233,6 @@ class ProtlakeWriter:
         cif_path: str,
         light_metadata: Dict[str, Any],
         heavy_metadata: Optional[Dict[str, Any]] = None,
-        max_lease_retries: int = 200,
     ) -> Dict[str, Any]:
         """
         Write a CIF file with metadata to Protlake.
@@ -244,7 +243,6 @@ class ProtlakeWriter:
             cif_path: Path to the CIF file.
             light_metadata: Dictionary of user-defined fields matching user_schema.
             heavy_metadata: Optional heavy metadata for JSON shard (if write_json_shards=True).
-            max_lease_retries: Maximum retries on lease mismatch (concurrent write conflicts).
         
         Returns:
             Dictionary with 'id_hex' and storage location info.
@@ -254,7 +252,6 @@ class ProtlakeWriter:
             bcif_bytes=bcif_bytes,
             light_metadata=light_metadata,
             heavy_metadata=heavy_metadata,
-            max_lease_retries=max_lease_retries,
         )
 
     def write_pdb(
@@ -262,7 +259,6 @@ class ProtlakeWriter:
         pdb_data: str | bytes,
         light_metadata: Dict[str, Any],
         heavy_metadata: Optional[Dict[str, Any]] = None,
-        max_lease_retries: int = 200,
     ) -> Dict[str, Any]:
         """
         Write a PDB structure with metadata to Protlake.
@@ -276,7 +272,6 @@ class ProtlakeWriter:
             bcif_bytes=bcif_bytes,
             light_metadata=light_metadata,
             heavy_metadata=heavy_metadata,
-            max_lease_retries=max_lease_retries,
         )
 
     def write_pdb_file(
@@ -284,7 +279,6 @@ class ProtlakeWriter:
         pdb_path: str,
         light_metadata: Dict[str, Any],
         heavy_metadata: Optional[Dict[str, Any]] = None,
-        max_lease_retries: int = 200,
     ) -> Dict[str, Any]:
         """
         Write a PDB file with metadata to Protlake.
@@ -296,7 +290,6 @@ class ProtlakeWriter:
             bcif_bytes=bcif_bytes,
             light_metadata=light_metadata,
             heavy_metadata=heavy_metadata,
-            max_lease_retries=max_lease_retries,
         )
     
     def write_bcif(
@@ -304,124 +297,146 @@ class ProtlakeWriter:
         bcif_bytes: bytes,
         light_metadata: Dict[str, Any],
         heavy_metadata: Optional[Dict[str, Any]] = None,
-        max_lease_retries: int = 2000,
     ) -> Dict[str, Any]:
         """
-        Write pre-converted BCIF bytes with metadata to Protlake.
+        Buffer pre-converted BCIF bytes with metadata for later flushing.
+        
+        Records are accumulated in memory and written to shard files in
+        batches when the buffer reaches ``cfg.batch_size`` (or when
+        :meth:`flush` / :meth:`finalize` is called explicitly).
         
         Args:
             bcif_bytes: BCIF (BinaryCIF) content as bytes.
             light_metadata: Dictionary of user-defined fields matching user_schema.
             heavy_metadata: Optional heavy metadata for JSON shard (if write_json_shards=True).
-            max_lease_retries: Maximum retries on lease mismatch (concurrent write conflicts).
         
         Returns:
-            Dictionary with 'id_hex' and storage location info.
+            Dictionary with 'id_hex'.
         """
         # Prepare heavy metadata if needed
-        json_pack_bytes_comp = None
+        has_json = False
         if self.cfg.write_json_shards and heavy_metadata is not None:
             serialized = heavy_metadata
             if self.cfg.heavy_serializer is not None:
                 serialized = self.cfg.heavy_serializer(heavy_metadata)
             json_pack_bytes = msgpack.packb(serialized, use_bin_type=True, use_single_float=True)
             json_pack_bytes_comp = self._zstd_compressor.compress(json_pack_bytes)
+            self.json_packer.append(json_pack_bytes_comp)
+            has_json = True
         
-        # Retry loop for lease mismatch scenarios
-        bcif_pack = None
-        json_pack = None
+        # Buffer BCIF payload
+        rec_id = self.bcif_packer.append(bcif_bytes)
         
+        # Store light metadata for delta-row construction at flush time
+        if self.cfg.light_serializer is not None:
+            light_metadata = self.cfg.light_serializer(light_metadata)
+        self._pending.append((light_metadata, has_json))
+        
+        # Flush if buffer exceeds threshold
+        if self.bcif_packer.buffer_len() >= self.cfg.batch_size:
+            self.flush()
+        
+        return {"id_hex": rec_id.hex()}
+    
+    def _flush_shards(self, max_lease_retries: int = 200) -> None:
+        """Flush shard buffers and build corresponding delta rows.
+
+        Each shard writer is flushed with its own LeaseMismatchRetry loop.
+        On success the resulting PackRecords are zipped with the pending
+        light-metadata entries and fed to the DeltaAppender.
+        """
+        if not self._pending:
+            return
+
+        # --- flush BCIF shard writer ---
+        bcif_records = None
         for attempt in range(1, max_lease_retries + 1):
             try:
-                # Pick shards
-                bcif_shard_path = self.bcif_packer.choose_shard()
-                if self.cfg.write_json_shards and json_pack_bytes_comp is not None:
-                    json_shard_path = self.json_packer.choose_shard()
-                    # Append JSON to shard
-                    json_pack = self.json_packer.append(json_shard_path, json_pack_bytes_comp, rec_id=None)
-                    logger.debug(
-                        f"packed json id={json_pack['id_hex'][:12]}… "
-                        f"shard={os.path.basename(json_pack['shard_path'])} "
-                        f"off={json_pack['off']} len={json_pack['length']}"
-                    )
-                
-                # Append BCIF to shard
-                bcif_pack = self.bcif_packer.append(bcif_shard_path, bcif_bytes, rec_id=None)
-                logger.debug(
-                    f"packed bcif id={bcif_pack['id_hex'][:12]}… "
-                    f"shard={os.path.basename(bcif_pack['shard_path'])} "
-                    f"off={bcif_pack['off']} len={bcif_pack['length']}"
-                )
-                
-                # Success
+                bcif_records = self.bcif_packer.flush()
                 break
-                
             except LeaseMismatchRetry as e:
                 if attempt >= max_lease_retries:
                     raise RuntimeError(
-                        f"Failed to write after {max_lease_retries} lease retry attempts. "
-                        f"All shards appear contested. Last error: {e}"
+                        f"Failed to flush BCIF shards after {max_lease_retries} "
+                        f"lease retry attempts. Last error: {e}"
                     )
                 backoff = 5.0 * random.uniform(0.8, 1.2)
                 logger.warning(
-                    f"Lease mismatch on attempt {attempt}/{max_lease_retries}, "
+                    f"BCIF lease mismatch on flush attempt {attempt}/{max_lease_retries}, "
                     f"retrying in {backoff:.2f}s..."
                 )
                 time.sleep(backoff)
-                continue
-        
-        # Build the row for Delta table
-        core_data = {
-            "id": bcif_pack["id_bytes"],
-            "id_hex": bcif_pack["id_hex"],
-            "bcif_shard": bcif_pack["shard_path"],
-            "bcif_off": int(bcif_pack["off"]),
-            "bcif_data_off": int(bcif_pack["data_off"]),
-            "bcif_len": int(bcif_pack["length"]),
-        }
-        
-        if self.cfg.write_json_shards:
-            if json_pack is not None:
-                core_data.update({
-                    "json_shard": json_pack["shard_path"],
-                    "json_off": int(json_pack["off"]),
-                    "json_data_off": int(json_pack["data_off"]),
-                    "json_len": int(json_pack["length"]),
-                })
-            else:
-                # No heavy metadata provided
-                core_data.update({
-                    "json_shard": "",
-                    "json_off": 0,
-                    "json_data_off": 0,
-                    "json_len": 0,
-                })
-        
-        # Merge core data with light metadata
-        if self.cfg.light_serializer is not None:
-            light_metadata = self.cfg.light_serializer(light_metadata)
-        delta_row = {**core_data, **light_metadata}
-        self.delta_appender.add_row(delta_row)
-        
-        return {
-            "id_hex": bcif_pack["id_hex"],
-            "bcif_shard": bcif_pack["shard_path"],
-            "bcif_off": bcif_pack["off"],
-        }
-    
+
+        # --- flush JSON shard writer ---
+        json_records: list = []
+        if self.json_packer and self.json_packer.buffer_len() > 0:
+            for attempt in range(1, max_lease_retries + 1):
+                try:
+                    json_records = self.json_packer.flush()
+                    break
+                except LeaseMismatchRetry as e:
+                    if attempt >= max_lease_retries:
+                        raise RuntimeError(
+                            f"Failed to flush JSON shards after {max_lease_retries} "
+                            f"lease retry attempts. Last error: {e}"
+                        )
+                    backoff = 5.0 * random.uniform(0.8, 1.2)
+                    logger.warning(
+                        f"JSON lease mismatch on flush attempt {attempt}/{max_lease_retries}, "
+                        f"retrying in {backoff:.2f}s..."
+                    )
+                    time.sleep(backoff)
+
+        # --- build delta rows ---
+        json_iter = iter(json_records)
+        for i, (light_meta, has_json) in enumerate(self._pending):
+            bcif_pack = bcif_records[i]
+            core_data = {
+                "id": bcif_pack["id_bytes"],
+                "id_hex": bcif_pack["id_hex"],
+                "bcif_shard": bcif_pack["shard_path"],
+                "bcif_off": int(bcif_pack["off"]),
+                "bcif_data_off": int(bcif_pack["data_off"]),
+                "bcif_len": int(bcif_pack["length"]),
+            }
+            if self.cfg.write_json_shards:
+                if has_json:
+                    json_pack = next(json_iter)
+                    core_data.update({
+                        "json_shard": json_pack["shard_path"],
+                        "json_off": int(json_pack["off"]),
+                        "json_data_off": int(json_pack["data_off"]),
+                        "json_len": int(json_pack["length"]),
+                    })
+                else:
+                    core_data.update({
+                        "json_shard": "",
+                        "json_off": 0,
+                        "json_data_off": 0,
+                        "json_len": 0,
+                    })
+            delta_row = {**core_data, **light_meta}
+            self.delta_appender.add_row(delta_row)
+
+        self._pending.clear()
+
     def flush(self) -> None:
-        """Flush buffered rows to the Delta table."""
+        """Flush all buffered data: shard records and Delta table rows."""
+        logger.info(f"Flushing {self.bcif_packer.buffer_len()} records to shards and Delta table...")
+        t0 = time.time()
+        self._flush_shards()
         self.delta_appender.flush()
+        logger.info(f"Flush complete in {time.time() - t0:.2f}s")
     
     def finalize(self) -> None:
         """Flush all pending data. Called automatically on exit."""
         logger.info("Finalizing ProtlakeWriter")
-        logger.info(f"  Flushing {self.delta_appender.row_count()} rows")
-        self.delta_appender.flush()
+        logger.info(f"  Pending shard records: {self.bcif_packer.buffer_len()}")
+        self.flush()
     
     def row_count(self) -> int:
-        """Return the number of buffered rows not yet flushed."""
-        return self.delta_appender.row_count()
+        """Return the total number of buffered rows not yet committed to Delta."""
+        return len(self._pending) + self.delta_appender.row_count()
     
     # --------------- Query methods ---------------
     

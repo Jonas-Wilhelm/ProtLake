@@ -182,30 +182,23 @@ class StagingWriter:
 class SpoolIngester:
     """Ingest published staging batches from ``spool/ready`` into a ProtlakeWriter."""
 
-    def __init__(self, protlake_dir: str, writer: ProtlakeWriter, min_entries: int = 1):
+    def __init__(self, protlake_dir: str, writer: ProtlakeWriter):
         _, ready_root = ensure_spool_dirs(protlake_dir)
         self._ready_root = ready_root
         self.writer = writer
-        self.min_entries = min_entries
 
     def _list_ready_batches(self) -> List[str]:
         batch_dirs = []
-        for name in os.listdir(self._ready_root):
-            path = os.path.join(self._ready_root, name)
-            if os.path.isdir(path):
-                batch_dirs.append(path)
-        return sorted(batch_dirs)
+        with os.scandir(self._ready_root) as it:
+            for entry in it:
+                if entry.is_dir():
+                    batch_dirs.append(entry.path)
+        return batch_dirs
 
     def _load_manifest(self, batch_dir: str) -> Dict[str, Any]:
         manifest_path = os.path.join(batch_dir, "manifest.json")
         with open(manifest_path, "r") as f:
             return json.load(f)
-
-    def _total_ready_entries(self, batch_dirs: List[str]) -> int:
-        total = 0
-        for batch_dir in batch_dirs:
-            total += int(self._load_manifest(batch_dir).get("entry_count", 0))
-        return total
 
     def _iter_group_ids(self, batch_dir: str) -> List[str]:
         group_ids = []
@@ -236,7 +229,6 @@ class SpoolIngester:
             )
             ingested += 1
 
-        self.writer.flush()
         shutil.rmtree(batch_dir)
         return ingested
 
@@ -244,15 +236,8 @@ class SpoolIngester:
         batch_dirs = self._list_ready_batches()
         if not batch_dirs:
             return {"processed_batches": 0, "processed_entries": 0, "pending_entries": 0}
-
-        pending_entries = self._total_ready_entries(batch_dirs)
-        if pending_entries < self.min_entries:
-            logger.info(
-                "Skipping spool ingest: %d ready entries below min_entries=%d",
-                pending_entries,
-                self.min_entries,
-            )
-            return {"processed_batches": 0, "processed_entries": 0, "pending_entries": pending_entries}
+        else:
+            logger.info(f"Found {len(batch_dirs)} batch(es) ready to ingest")
 
         processed_batches = 0
         processed_entries = 0
@@ -266,10 +251,13 @@ class SpoolIngester:
             processed_entries += self._ingest_batch(batch_dir)
             processed_batches += 1
 
-        if run_maintenance and processed_entries > 0:
-            t0 = time.time()
-            self.writer.maintenance()
-            print(f"DeltaTable maintenance completed in {time.time() - t0:.1f} seconds.")
+        if processed_entries > 0:
+            self.writer.flush()
+            if run_maintenance:
+                logger.info("Running DeltaTable maintenance...")
+                t0 = time.time()
+                self.writer.maintenance()
+                logger.info(f"DeltaTable maintenance completed in {time.time() - t0:.1f} seconds.")
 
         return {
             "processed_batches": processed_batches,

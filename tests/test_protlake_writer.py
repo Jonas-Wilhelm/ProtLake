@@ -275,8 +275,6 @@ class TestProtlakeWriterWrite:
         
         assert "id_hex" in result
         assert len(result["id_hex"]) == 64  # sha256 hex
-        assert "bcif_shard" in result
-        assert "bcif_off" in result
     
     def test_write_multiple_noisy_structures(self, protlake_writer, base_structure):
         """Write 100 noisy variants of the base structure."""
