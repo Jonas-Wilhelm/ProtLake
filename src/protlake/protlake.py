@@ -278,6 +278,44 @@ class ProtLake():
             # return list or if only one, return single string
             return out_str_list if len(out_str_list) > 1 else out_str_list[0]
 
+    def to_fasta(
+        self,
+        path: str,
+        name_cols: str | list[str] = 'name',
+        sep: str = '_',
+    ) -> None:
+        self.load()
+
+        if 'sequence' not in self.colnames:
+            print("No 'sequence' column found. Exiting without writing FASTA.")
+            return
+
+        if isinstance(name_cols, str):
+            name_cols = [name_cols]
+
+        missing_name_cols = set(name_cols) - set(self.colnames)
+        if missing_name_cols:
+            raise ValueError(f"ProtLake is missing FASTA name columns: {missing_name_cols}")
+
+        dataset = self.dt.to_pyarrow_dataset()
+        columns = [*name_cols, 'sequence']
+        table = dataset.to_table(columns=columns)
+        df = table.to_pandas()
+
+        names = (
+            df[name_cols]
+            .astype(str)
+            .agg(sep.join, axis=1)
+            .tolist()
+        )
+        sequences = df['sequence'].tolist()
+
+        with open(path, 'w') as fasta_handle:
+            for name, sequence in zip(names, sequences):
+                if sequence is None:
+                    continue
+                fasta_handle.write(f">{name}\n{sequence}\n")
+
     # --------------- get_seq ---------------
     # ---------------------------------------
     @overload
@@ -346,11 +384,6 @@ class ProtLake():
 
         return seq_list if len(seq_list) > 1 else seq_list[0]
 
-    def __repr__(self):
-        if self.n_row is None:
-            self.nrow()
-        return f"ProtLake at {self.path} with {self.n_row:,} structures"
-
     def dedupe_by_name(self, name_col: str = 'name', batch_size: int = 100_000, dry_run: bool = False) -> None:
         """
         Remove duplicate entries based on the specified name column, keeping only the first occurrence.
@@ -403,7 +436,6 @@ class ProtLake():
                 rate,
             )
 
-
         if ids_to_remove:
             logger.info(f"Removing {len(ids_to_remove)} duplicate entries based on column '{name_col}'")
             if not dry_run:
@@ -414,3 +446,8 @@ class ProtLake():
                 logger.info("Dry run enabled, not actually deleting duplicates.")
         else:
             logger.info(f"No duplicates found based on column '{name_col}'")
+
+    def __repr__(self):
+        if self.n_row is None:
+            self.nrow()
+        return f"ProtLake at {self.path} with {self.n_row:,} structures"
