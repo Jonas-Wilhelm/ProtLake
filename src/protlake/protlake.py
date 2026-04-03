@@ -1,4 +1,5 @@
 import logging
+from math import e
 import os
 import time
 from typing import Any, Dict, Optional, overload
@@ -349,3 +350,67 @@ class ProtLake():
         if self.n_row is None:
             self.nrow()
         return f"ProtLake at {self.path} with {self.n_row:,} structures"
+
+    def dedupe_by_name(self, name_col: str = 'name', batch_size: int = 100_000, dry_run: bool = False) -> None:
+        """
+        Remove duplicate entries based on the specified name column, keeping only the first occurrence.
+
+        This function reads the Delta table in batches, identifies duplicates based on the name column,
+        and removes all but the first occurrence of each duplicate entry. It uses a set to track seen names
+        and a list to collect IDs of entries to remove. After processing all batches, it deletes the identified
+        duplicate entries from the Delta table.
+
+        Args:
+            name_col (str): The name of the column to check for duplicates. Default is 'name'.
+            batch_size (int): The number of rows to process in each batch. Default is 10,000.
+            dry_run (bool): If True, do not actually delete duplicates, just log them. Default is False.
+        """
+        self.load()
+        self.nrow()
+
+        dataset = self.dt.to_pyarrow_dataset()
+        scanner = ds.Scanner.from_dataset(
+            dataset,
+            columns=["id_hex", name_col],
+            batch_size=batch_size,
+        )
+
+        seen_names = set()
+        ids_to_remove = []
+        processed_rows = 0
+        start_time = time.perf_counter()
+
+        for batch in scanner.to_batches():
+            cols = batch.to_pydict()
+            ids = cols["id_hex"]
+            names = cols[name_col]
+
+            for rec_id, name in zip(ids, names):
+                processed_rows += 1
+                if name in seen_names:
+                    ids_to_remove.append(rec_id)
+                else:
+                    seen_names.add(name)
+            
+            elapsed = time.perf_counter() - start_time
+            rate = processed_rows / elapsed if elapsed > 0 else 0.0
+            pct = (100.0 * processed_rows / self.n_row) if self.n_row else 0.0
+            logger.info(
+                "Scanned %s rows for deduplication (%.1f %%), found %s duplicates so far, rate=%.0f rows/s",
+                f"{processed_rows:,}",
+                pct,
+                f"{len(ids_to_remove):,}",
+                rate,
+            )
+
+
+        if ids_to_remove:
+            logger.info(f"Removing {len(ids_to_remove)} duplicate entries based on column '{name_col}'")
+            if not dry_run:
+                quoted = [f"'{v.replace(chr(39), chr(39)*2)}'" for v in ids_to_remove]
+                self.dt.delete(f"id_hex IN ({', '.join(quoted)})")
+                self.load()  # Reload to update state after deletion
+            else:
+                logger.info("Dry run enabled, not actually deleting duplicates.")
+        else:
+            logger.info(f"No duplicates found based on column '{name_col}'")
