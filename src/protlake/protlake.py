@@ -1,4 +1,6 @@
+import logging
 import os
+import time
 from typing import Any, Dict, Optional, overload
 from deltalake import DeltaTable, write_deltalake
 from protlake.query import check_exists as delta_check_exists
@@ -7,14 +9,18 @@ from protlake.utils import (
     deltatable_maintenance,
     bcif_shard_to_mmCIF_file,
     bcif_shard_to_mmCIF_str,
-    pread_bcif_to_atom_array
+    pread_bcif_to_atom_array,
+    read_bytes_from_shard_fd,
 )
 from protlake.write.writer import get_core_schema_fields
 from protlake.write.core import RetryConfig
 import pyarrow as pa
+import pyarrow.dataset as ds
 import pandas as pd
 import numpy as np
 from biotite.structure import to_sequence
+
+logger = logging.getLogger(__name__)
 
 class ProtLake():
     def __init__(self, path, create=False, retry_conf: Optional[RetryConfig] = None):
@@ -71,6 +77,85 @@ class ProtLake():
         if reload:
             self.load()
         return True
+
+    def validate_bcif_entries(
+        self,
+        batch_size: int = 10_000,
+    ) -> list[bytes]:
+        """
+        Stream over the Delta table and return ids whose BCIF payload cannot be
+        read from the shard or whose CRC check fails.
+
+        Only the columns required for validation are projected from the Delta table.
+        """
+        self.load()
+        self.nrow()
+
+        dataset = self.dt.to_pyarrow_dataset()
+        scanner = ds.Scanner.from_dataset(
+            dataset,
+            columns=["id", "bcif_shard", "bcif_data_off", "bcif_len"],
+            batch_size=batch_size,
+        )
+
+        invalid_ids: list[bytes] = []
+        processed_rows = 0
+        start_time = time.perf_counter()
+        fd_cache: dict[str, int] = {}
+
+        try:
+            for batch in scanner.to_batches():
+                cols = batch.to_pydict()
+                ids = cols["id"]
+                shards = cols["bcif_shard"]
+                offsets = cols["bcif_data_off"]
+                lengths = cols["bcif_len"]
+
+                for rec_id, shard, offset, length in zip(ids, shards, offsets, lengths):
+                    processed_rows += 1
+
+                    if shard is None or offset is None or length is None:
+                        invalid_ids.append(rec_id)
+                        continue
+
+                    shard_path = os.path.join(self.shard_path, str(shard))
+                    try:
+                        fd = fd_cache.get(shard_path)
+                        if fd is None:
+                            fd = os.open(shard_path, os.O_RDONLY)
+                            fd_cache[shard_path] = fd
+
+                        read_bytes_from_shard_fd(fd, offset, length)
+                    except Exception:
+                        invalid_ids.append(rec_id)
+
+                elapsed = time.perf_counter() - start_time
+                rate = processed_rows / elapsed if elapsed > 0 else 0.0
+                pct = (100.0 * processed_rows / self.n_row) if self.n_row else 0.0
+                logger.info(
+                    "Validated %s BCIF entries (%.1f %%), invalid=%s, rate=%.0f rows/s",
+                    f"{processed_rows:,}",
+                    pct,
+                    f"{len(invalid_ids):,}",
+                    rate,
+                )
+        finally: # Close any open file descriptors
+            for fd in fd_cache.values():
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+
+        elapsed = time.perf_counter() - start_time
+        rate = processed_rows / elapsed if elapsed > 0 else 0.0
+        logger.info(
+            "Finished BCIF validation: scanned %s rows, invalid=%s, elapsed=%.1fs, rate=%.0f rows/s",
+            f"{processed_rows:,}",
+            f"{len(invalid_ids):,}",
+            elapsed,
+            rate,
+        )
+        return invalid_ids
 
     # ------------- extract_cif -------------
     # ---------------------------------------

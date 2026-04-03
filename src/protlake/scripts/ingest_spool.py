@@ -36,8 +36,8 @@ def main():
                         help="Polling interval in seconds for continuous ingest mode. (default: 600)")
     parser.add_argument("--run-once", action="store_true",
                         help="Process one sweep and exit instead of polling forever")
-    parser.add_argument("--batch-size", type=int, default=100,
-                        help="Batch size for Protlake writer. (default: 100)")
+    parser.add_argument("--batch-size", type=int, default=1000,
+                        help="Batch size for Protlake writer. (default: 1000)")
     parser.add_argument("--shard-size", type=int, default=1 << 30,
                         help="Target maximum shard size in bytes. (default: 1 << 30)")
     parser.add_argument("--log-level", type=str, default="INFO",
