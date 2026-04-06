@@ -32,6 +32,8 @@ class ProtLake():
         self.n_row = None
 
         self.dt = None
+        self.colnames = None
+        self.shard_index_cache = None
         self.load(create=create)
 
     def load(self, create=False) -> bool:
@@ -77,6 +79,43 @@ class ProtLake():
         deltatable_maintenance(self.dt, target_size=target_size, max_concurrent_tasks=max_concurrent_tasks, retention_hours=retention_hours)
         if reload:
             self.load()
+        return True
+
+    def load_shard_index_cache(
+            self, 
+            columns: str | list[str] | None = None,
+            filters: Optional[Dict[str, list[Any]]] = None
+        ) -> bool:
+        required = ["bcif_shard", "bcif_data_off", "bcif_len"]
+        if isinstance(columns, str):
+            columns = [columns]
+        columns = list(columns or [])
+        filters = filters or {}
+
+        # include required columns, requested columns, and filter columns
+        return_cols = set(required + columns)
+        filter_cols = set(filters.keys())
+        all_cols = return_cols.union(filter_cols)
+
+        # check that all referenced cols are in the table and throw error if not
+        missing = all_cols - set(self.colnames)
+        if missing:
+            raise ValueError(f"load_shard_index: Some requested columns are not in the ProtLake: {missing}")
+
+        # build deltalake filter format:
+        # {"name": ["a", "b"]} -> [("name", "in", ["a", "b"])]
+        dl_filters = []
+        for col, values in filters.items():
+            if values is None or len(values) == 0 or not isinstance(values, (list, set, tuple)):
+                raise ValueError(f"Filter values for column '{col}' must be a non-empty list, set, or tuple.")
+            dl_filters.append((col, "in", list(values)))
+
+        table = self.dt.to_pyarrow_table(
+            columns=list(return_cols),
+            filters=dl_filters if dl_filters else None,
+        )
+
+        self.shard_index_cache = table
         return True
 
     def validate_bcif_entries(
