@@ -24,7 +24,7 @@ class RetryConfig:
     max_sleep: float = 10.0
     jitter: float = 0.2
 
-def retry_with_backoff(operation, config: RetryConfig, description: str = "operation"):
+def retry_with_backoff(operation, config: RetryConfig = RetryConfig(), description: str = "operation"):
     """Execute an operation (DeltaTable loading or writing) with retries on known Delta concurrency errors."""
     sleep_for = config.base_sleep
     for attempt in range(1, config.max_retries + 1):
@@ -35,13 +35,13 @@ def retry_with_backoff(operation, config: RetryConfig, description: str = "opera
                 logger.warning(f"{description} failed with retryable error (attempt {attempt}/{config.max_retries}). Retrying in {sleep_for:.2f}s... error: {e}")
                 time.sleep(sleep_for)
                 sleep_for = min(sleep_for * 2, config.max_sleep) + random.uniform(-config.jitter, config.jitter)
-                sleep_for = max(0, sleep_for)  # ensure sleep_for is non-negative
+                sleep_for = max(config.base_sleep, sleep_for)  # ensure sleep_for is non-negative and respects base_sleep
                 continue
             # not retryable or out of retries
             logger.error(f"{description} failed permanently after {attempt} attempts.")
             raise
 
-def load_delta_table_with_retries(delta_path, retry_config: RetryConfig) -> DeltaTable:
+def load_delta_table_with_retries(delta_path, retry_config: RetryConfig = RetryConfig()) -> DeltaTable:
     """Load a DeltaTable with retries on known concurrency errors."""
     return retry_with_backoff(
         lambda: DeltaTable(f"file://{os.path.abspath(delta_path)}"),

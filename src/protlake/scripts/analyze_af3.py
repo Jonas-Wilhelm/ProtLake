@@ -16,9 +16,11 @@ def main():
     parser.add_argument("--protlake-path", type=str, required=False, 
                         help="Path to the Protlake directory to analyze")
     parser.add_argument("--design-dir", type=str, required=False, 
-                        help="Path to the design directory. (mutually exclusive with --design-pdb)")
+                        help="Path to the design directory. (mutually exclusive with --design-pdb and --design-protlake)")
     parser.add_argument("--design-pdb", type=str, required=False,
-                        help="Path to the design PDB file if single PDB is used instead of design directory. (mutually exclusive with --design-dir)")
+                        help="Path to the design PDB file if single PDB is used instead of design directory. (mutually exclusive with --design-dir and --design-protlake)")
+    parser.add_argument("--design-protlake", type=str, required=False, 
+                        help="If set, the design models will be read from the Protlake instead of from PDB files. (mutually exclusive with --design-dir and --design-pdb)")
     parser.add_argument("--staging-path", type=str, required=False,
                         help="Path to the staging deltatable, default: <protlake-path>/delta_staging_table")
     parser.add_argument("--local", action="store_true", 
@@ -64,14 +66,16 @@ def main():
     # Submit array job
     # Flatten the tuple for --wrap into a single string
     if not launcher_args.merge_only:
-        if launcher_args.design_dir is None and launcher_args.design_pdb is None:
-            raise ValueError("Error: --design-dir or --design-pdb argument is required when not using --merge-only mode")
-        if launcher_args.design_dir is not None and launcher_args.design_pdb is not None:
-            raise ValueError("Error: --design-dir and --design-pdb arguments are mutually exclusive")
+        if launcher_args.design_dir is None and launcher_args.design_pdb is None and launcher_args.design_protlake is None:
+            raise ValueError("Error: --design-dir, --design-pdb, or --design-protlake argument is required when not using --merge-only mode")
+        if sum([launcher_args.design_dir is not None, launcher_args.design_pdb is not None, launcher_args.design_protlake is not None]) > 1:
+            raise ValueError("Error: --design-dir, --design-pdb, and --design-protlake arguments are mutually exclusive")
         if launcher_args.design_dir is not None:
             worker_args.extend(["--design-dir", launcher_args.design_dir])
         if launcher_args.design_pdb is not None:
             worker_args.extend(["--design-pdb", launcher_args.design_pdb])
+        if launcher_args.design_protlake is not None:
+            worker_args.extend(["--design-protlake", launcher_args.design_protlake])
 
         # Get current version of the delta table (only needed for worker jobs)
         _, delta_path = get_protlake_dirs(launcher_args.protlake_path)

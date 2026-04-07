@@ -11,6 +11,7 @@ from protlake.utils import (
     pread_bcif_to_atom_array, 
     pread_json_msgpack_to_dict
 )
+from protlake.write.core import retry_with_backoff
 from biotite.structure import filter_amino_acids, superimpose, rmsd, AtomArray, get_residue_starts
 from biotite.structure.io import load_structure, save_structure
 from biotite.structure.info import standardize_order
@@ -293,8 +294,12 @@ def main():
     parser.add_argument("--protlake-path", type=str, required=True, help="Path to the Protlake directory to analyze")
     parser.add_argument("--snapshot-ver", type=int, required=True, help="DeltaLake snapshot version to use")
     parser.add_argument("--staging-path", type=str, required=True, help="Path to the staging directory, default: <protlake-path>/delta_staging_table")
-    parser.add_argument("--design-dir", type=str, required=False, help="Path to the design directory")
-    parser.add_argument("--design-pdb", type=str, required=False, help="Path to the design PDB file if single PDB is used instead of design directory.")
+    
+    group_design_arg = parser.add_mutually_exclusive_group(required=True)
+    group_design_arg.add_argument("--design-dir", type=str, required=False, help="Path to the design directory. Mutually exclusive with --design-pdb and --design-protlake.")
+    group_design_arg.add_argument("--design-pdb", type=str, required=False, help="Path to the design PDB file if single PDB is used instead of design directory. Mutually exclusive with --design-dir and --design-protlake.")
+    group_design_arg.add_argument("--design-protlake", type=str, required=False, help="Path to a Protlake directory containing the design models. Mutually exclusive with --design-dir and --design-pdb.")
+    
     parser.add_argument("--seq-mismatch", action="store_true", help="Accept sequence mismatches between design and AF3 output.")
     parser.add_argument("--ncaa", type=str, nargs='+', required=False, help="List of NCAA 3-letter CCD codes.")
     parser.add_argument("--replace_lig_res_names", type=str, required=False, nargs="+", 
@@ -334,7 +339,7 @@ def main():
     
     # Round array tasks to 1 significant figure
     batch_multiplicator = int(round(num_array_tasks, -int(math.floor(math.log10(abs(num_array_tasks))))))
-    batch_size = min(1_000 * batch_multiplicator, 1_000_000)
+    batch_size = min(2_000 * batch_multiplicator, 1_000_000)
     print(f"Using batch size of {batch_size} for scanning with {num_array_tasks} array tasks")
     scanner = ds.scanner(
         # columns=["name"],       # project only what you need
@@ -342,12 +347,17 @@ def main():
         batch_size=batch_size
     )
 
-    if args.design_dir is not None: # when not using single design PDB
+    if args.design_dir is not None:
         print("Creating design file index for fast access...")
         design_file_index_start = time.time()
         design_file_index = _build_file_index(args.design_dir) # build file index to speed up access to design models
         design_file_index_time = time.time() - design_file_index_start
         print(f"Built design file index with {len(design_file_index)} entries in {design_file_index_time:.3f} sec")
+    elif args.design_protlake is not None:
+        print("Loading design Protlake...")
+        pl_design = protlake.ProtLake(args.design_protlake)
+    elif args.design_pdb is not None:
+        print(f"Using single design PDB file: {args.design_pdb}")
 
     # process each batch
     for batch in scanner.to_batches():
@@ -363,6 +373,11 @@ def main():
 
         hashes = np.fromiter((xxh64(n).intdigest() for n in group_names), dtype=np.uint64)
         sel = (hashes % num_array_tasks) == my_task_id
+        group_names_sel = group_names[sel]
+        if args.protlake_path is not None:
+            t0 = time.time()
+            pl_design.load_shard_index_cache(columns = 'name', filters = {'name': group_names_sel.tolist()})
+            print(f"Loaded design shard index cache for {len(group_names_sel)} groups in {time.time() - t0:.2f} sec")
 
         # time for hashing and selecting
         end_hash_time = time.time()
@@ -374,9 +389,7 @@ def main():
             name = group_names[gi]
             rows = groups[gi]
             # read in design as atom array
-            if args.design_pdb is not None:
-                design_path = args.design_pdb
-            else: # when using design directory, look up design file path in index
+            if args.design_dir is not None: # when using design directory, look up design file path in index
                 design_path = design_file_index.get(f"{name}.pdb", [None])
                 if design_path is None:
                     print(f"Warning: Design file for {name} not found in design directory, skipping")
@@ -384,9 +397,12 @@ def main():
                 if len(design_path) > 1:
                     print(f"Warning: Multiple design files found for {name} in design directory, using first one found: {design_path[0]}")
                 
-                design_path = design_path[0]
+                aa_design = load_structure(design_path[0])
+            elif args.design_protlake is not None: # when using design Protlake, read design model from Protlake
+                aa_design = pl_design.load_atom_array_from_shard_index_cache({'name': name})
+            elif args.design_pdb is not None: # when using single design PDB, use that for all groups
+                aa_design = load_structure(args.design_pdb)
 
-            aa_design = load_structure(design_path)
             # remove hydrogens which are not in af3 output anyway
             aa_design = aa_design[aa_design.element != "H"]
             # if ncaa specified, set those residues to non-hetero
@@ -520,22 +536,11 @@ def main():
             }
         )
 
-        max_retries = 10
-        attempt = 1
-        while True:
-            try:
-                write_deltalake(staging_path, staging_table, mode="append", configuration={'delta.checkpointInterval': '500'})
-                break
-            except Exception as e:
-                print(f"Error writing to DeltaLake (attempt {attempt}/{max_retries})")
-                if attempt == max_retries:
-                    print("Max retries for writing to DeltaLake reached, raising exception.")
-                    raise e
-                else:
-                    wait_time = min(max(2 ** attempt, 10), 60*2) * random.uniform(0.8, 1.2)  # exponential backoff with jitter
-                    print(f"Retrying writing to DeltaLake in {wait_time:.1f} seconds...")
-                    time.sleep(wait_time)
-                    attempt += 1
+        retry_with_backoff(
+            lambda: write_deltalake(staging_path, staging_table, mode="append", configuration={'delta.checkpointInterval': '500'}),
+            description="write_deltalake in analysis_worker",
+        )
+
 
 if __name__ == "__main__":
     main()
