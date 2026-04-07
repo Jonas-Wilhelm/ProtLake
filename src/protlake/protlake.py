@@ -7,15 +7,18 @@ from deltalake import DeltaTable, write_deltalake
 from protlake.query import check_exists as delta_check_exists
 from protlake.utils import (
     DeltaTable_nrow, 
+    _bcif_bytes_to_atom_array,
     deltatable_maintenance,
     bcif_shard_to_mmCIF_file,
     bcif_shard_to_mmCIF_str,
     pread_bcif_to_atom_array,
+    read_bytes_from_shard,
     read_bytes_from_shard_fd,
 )
 from protlake.write.writer import get_core_schema_fields
 from protlake.write.core import RetryConfig
 import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.dataset as ds
 import pandas as pd
 import numpy as np
@@ -110,13 +113,54 @@ class ProtLake():
                 raise ValueError(f"Filter values for column '{col}' must be a non-empty list, set, or tuple.")
             dl_filters.append((col, "in", list(values)))
 
-        table = self.dt.to_pyarrow_table(
-            columns=list(return_cols),
-            filters=dl_filters if dl_filters else None,
-        )
+            table = self.dt.to_pyarrow_table(
+                columns=list(return_cols),
+                filters=dl_filters if dl_filters else None,
+            )
 
         self.shard_index_cache = table
         return True
+
+    def load_atom_array_from_shard_index_cache(
+        self,
+        specifications: Dict[str, Any],
+    ):
+        required = ["bcif_shard", "bcif_data_off", "bcif_len"]
+
+        if self.shard_index_cache is None:
+            raise ValueError("shard_index_cache is None. Call load_shard_index_cache() first.")
+
+        if not isinstance(specifications, dict) or len(specifications) == 0:
+            raise ValueError("specifications must be a non-empty dict of column/value filters.")
+
+        cache = self.shard_index_cache
+        missing = set(specifications.keys()) - set(cache.column_names)
+        if missing:
+            raise ValueError(f"Some specification columns are not in shard_index_cache: {missing}")
+
+        missing_required = set(required) - set(cache.column_names)
+        if missing_required:
+            raise ValueError(f"shard_index_cache is missing required columns: {missing_required}")
+
+        df = cache.to_pandas()
+        mask = pd.Series(True, index=df.index)
+        for col, value in specifications.items():
+            mask &= df[col] == value
+
+        matches = df.loc[mask]
+        if len(matches) != 1:
+            raise ValueError(
+                f"Expected exactly 1 row in shard_index_cache for specifications {specifications}, found {len(matches)}."
+            )
+
+        row = matches.iloc[0]
+        shard_path = os.path.join(self.shard_path, str(row["bcif_shard"]))
+        bcif_data = read_bytes_from_shard(
+            shard_path,
+            int(row["bcif_data_off"]),
+            int(row["bcif_len"]),
+        )
+        return _bcif_bytes_to_atom_array(bcif_data)
 
     def validate_bcif_entries(
         self,
