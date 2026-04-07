@@ -328,6 +328,7 @@ def is_retryable_delta_error(e: Exception) -> bool:
         "version 0 already exists",
         "table metadata is invalid: number of checkpoint files", # '0' is not equal to number of checkpoint metadata parts 'None'
         "generic deltatable error: non-contiguous log segment",
-        "failed to commit transaction"
+        "failed to commit transaction",
+        "invalid checkpoint: had a _last_checkpoint hint"
     ]
     return any(phrase in msg for phrase in retryable_phrases)

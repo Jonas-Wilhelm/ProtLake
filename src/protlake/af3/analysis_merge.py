@@ -11,6 +11,8 @@ def main():
                         help="path to the staging deltatable")
     parser.add_argument("--dont-delete-staging-table", action="store_true", 
                         help="if set, the staging-path directory will not be deleted after merging")
+    parser.add_argument("--ignore-row-count-mismatch", action="store_true",
+                        help="if set, the script will perform the merge even if the main table and staging table have different number of rows")
     args = parser.parse_args()
     protlake_path = args.protlake_path
     staging_path = args.staging_path
@@ -21,8 +23,19 @@ def main():
 
     dt_stage = DeltaTable(f"file://{os.path.abspath(staging_path)}")
 
-    if DeltaTable_nrow(dt) != DeltaTable_nrow(dt_stage):
-        print(f"Warning: main table has {DeltaTable_nrow(dt)} rows, but staging table has {DeltaTable_nrow(dt_stage)} rows.")
+    main_nrow = DeltaTable_nrow(dt)
+    stage_nrow = DeltaTable_nrow(dt_stage)
+
+    if main_nrow != stage_nrow:
+        if not args.ignore_row_count_mismatch:
+             raise ValueError(
+                (
+                     f"Row count mismatch: main table has {main_nrow} rows, but staging table has {stage_nrow} rows. "
+                     f"Use --ignore-row-count-mismatch to ignore this warning and proceed with the merge."
+                )
+             )
+        else:
+            print(f"Warning: main table has {main_nrow} rows, but staging table has {stage_nrow} rows.")
 
     dt.alter.add_columns(
         dt_stage.schema().fields
