@@ -374,14 +374,15 @@ def main():
         hashes = np.fromiter((xxh64(n).intdigest() for n in group_names), dtype=np.uint64)
         sel = (hashes % num_array_tasks) == my_task_id
         group_names_sel = group_names[sel]
-        if args.protlake_path is not None:
-            t0 = time.time()
-            pl_design.load_shard_index_cache(columns = 'name', filters = {'name': group_names_sel.tolist()})
-            print(f"Loaded design shard index cache for {len(group_names_sel)} groups in {time.time() - t0:.2f} sec")
 
         # time for hashing and selecting
         end_hash_time = time.time()
         print(f"Hashed and selected {sel.sum()} out of {len(sel)} groups in {end_hash_time - start_time:.3f} sec")
+        
+        if args.design_protlake is not None:
+            t0 = time.time()
+            pl_design.load_shard_index_cache(columns = 'name', filters = {'name': group_names_sel.tolist()})
+            print(f"Loaded design shard index cache for {len(group_names_sel)} groups in {time.time() - t0:.2f} sec")
 
         for gi, keep in enumerate(sel):
             if not keep:
@@ -528,6 +529,10 @@ def main():
         end_time = time.time()
         n_models = len(staging_columns.get_dict()['id_hex']['val'])
         print(f"Processed batch with {n_models} models in {end_time - start_time:.3f} sec")
+
+        if n_models == 0:
+            print("No models processed in this batch, skipping deltalake write")
+            continue
 
         staging_table = pa.table(
             {
