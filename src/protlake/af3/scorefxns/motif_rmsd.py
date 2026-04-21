@@ -51,7 +51,7 @@ def score(sfx_input: ScoreFunctionInput):
     CA_mask = (~aa_design.hetero & (aa_design.atom_name == "CA"))
 
     if CLI_args.superimpose_on_motif:
-        aa_af3_superimposed, _ = superimpose(aa_af3, aa_design, atom_mask=(contig_mask & CA_mask))
+        aa_af3_superimposed, _ = superimpose(aa_design, aa_af3, atom_mask=(contig_mask & CA_mask))
     else:
         aa_af3_superimposed = aa_af3
 

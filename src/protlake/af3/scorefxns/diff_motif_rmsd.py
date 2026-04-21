@@ -56,7 +56,7 @@ def score(sfx_input: ScoreFunctionInput):
     if sfx_input.CLI_args.diff_motif_align:
         motif_set = {_parse_chain_resid(v) for v in index_map.values()}
         motif_mask = [(c, r) in motif_set for c, r in zip(aa_design.chain_id, aa_design.res_id)]
-        aa_af3, _ = superimpose(aa_af3, aa_design, atom_mask=motif_mask)
+        aa_af3, _ = superimpose(aa_design, aa_af3, atom_mask=motif_mask)
     
     out = {}
     for k, v in index_map.items():
