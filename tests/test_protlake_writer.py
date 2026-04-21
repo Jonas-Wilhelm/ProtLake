@@ -79,7 +79,7 @@ def protlake_writer(output_dir, user_schema):
     cfg = ProtlakeWriterConfig(
         out_path=str(output_dir / "protlake_output"),
         user_schema=user_schema,
-        batch_size_metadata=25,  # Small batch for testing
+        batch_size=25,  # Small batch for testing
         shard_size=10 * 1024 * 1024,  # 10 MB shards for testing
         write_json_shards=True,
         zstd_level=3,  # Lower compression for speed
@@ -161,7 +161,7 @@ def _parallel_worker_write(
     cfg = ProtlakeWriterConfig(
         out_path=out_path,
         user_schema=schema,
-        batch_size_metadata=10,
+        batch_size=10,
         shard_size=10 * 1024 * 1024,  # 10 MB
         write_json_shards=True,
         claim_mode=True,
@@ -404,7 +404,7 @@ class TestSpoolIngester:
                     pa.field("sample_idx", pa.int32()),
                     pa.field("score", pa.float32()),
                 ]),
-                batch_size_metadata=10,
+                batch_size=10,
                 shard_size=10 * 1024 * 1024,
                 write_json_shards=True,
                 zstd_level=3,
@@ -422,7 +422,7 @@ class TestSpoolIngester:
         ready_batch_dir = staging.publish()
         assert ready_batch_dir is not None
 
-        ingester = SpoolIngester(str(protlake_dir), writer=writer, min_entries=2)
+        ingester = SpoolIngester(str(protlake_dir), writer=writer)
         result = ingester.run_once()
 
         assert result["processed_batches"] == 1
@@ -579,6 +579,63 @@ class TestProtlakeWriterQuery:
         # With 0.1 Å std noise, RMSD should be around 0.1 * sqrt(3) ≈ 0.17 Å
         expected_rmsd = NOISE_STD * np.sqrt(3)
         assert 0.05 < mean_rmsd < 0.5, f"Mean RMSD {mean_rmsd} outside expected range"
+
+
+class TestProtLakeShardIndexCache:
+    """Tests for shard index cache helpers on a materialized ProtLake."""
+
+    def test_load_shard_index_cache_without_filters(self, protlake_writer, output_dir):
+        from protlake.protlake import ProtLake
+
+        protlake_writer.flush()
+        pl = ProtLake(str(output_dir / "protlake_output"))
+
+        pl.load_shard_index_cache(columns="name")
+
+        assert pl.shard_index_cache is not None
+        assert set(pl.shard_index_cache.column_names) == {
+            "name",
+            "bcif_shard",
+            "bcif_data_off",
+            "bcif_len",
+        }
+        assert pl.shard_index_cache.num_rows >= NUM_SAMPLES + 3
+
+    def test_load_row_from_shard_index_cache(self, protlake_writer, output_dir):
+        from protlake.protlake import ProtLake
+
+        protlake_writer.flush()
+        pl = ProtLake(str(output_dir / "protlake_output"))
+        pl.load_shard_index_cache(columns=["name", "sample_idx"], filters={"name": ["test_single_pdb"]})
+
+        row = pl.load_row_from_shard_index_cache({"name": "test_single_pdb"})
+
+        assert row["name"] == "test_single_pdb"
+        assert row["sample_idx"] == 1001
+        assert row["bcif_shard"]
+        assert row["bcif_data_off"] >= 0
+        assert row["bcif_len"] > 0
+
+    def test_load_row_from_shard_index_cache_requires_unique_match(self, protlake_writer, output_dir):
+        from protlake.protlake import ProtLake
+
+        protlake_writer.flush()
+        pl = ProtLake(str(output_dir / "protlake_output"))
+        pl.load_shard_index_cache(columns=["name", "sample_idx"], filters={"name": ["6Y7A_noisy"]})
+
+        with pytest.raises(ValueError, match="Expected exactly 1 row in shard_index_cache"):
+            pl.load_row_from_shard_index_cache({"name": "6Y7A_noisy"})
+
+    def test_load_atom_array_from_shard_index_cache_uses_row_lookup(self, protlake_writer, output_dir, base_structure):
+        from protlake.protlake import ProtLake
+
+        protlake_writer.flush()
+        pl = ProtLake(str(output_dir / "protlake_output"))
+        pl.load_shard_index_cache(columns=["name"], filters={"name": ["test_single_pdb"]})
+
+        atoms = pl.load_atom_array_from_shard_index_cache({"name": "test_single_pdb"})
+
+        assert len(atoms) == len(base_structure)
 
 
 class TestProtlakeWriterCheckComplete:
