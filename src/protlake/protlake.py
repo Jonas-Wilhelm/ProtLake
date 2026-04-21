@@ -37,6 +37,7 @@ class ProtLake():
         self.dt = None
         self.colnames = None
         self.shard_index_cache = None
+        self._shard_index_cache_df = None
         self.load(create=create)
 
     def load(self, create=False) -> bool:
@@ -113,36 +114,40 @@ class ProtLake():
                 raise ValueError(f"Filter values for column '{col}' must be a non-empty list, set, or tuple.")
             dl_filters.append((col, "in", list(values)))
 
-            table = self.dt.to_pyarrow_table(
-                columns=list(return_cols),
-                filters=dl_filters if dl_filters else None,
-            )
+        table = self.dt.to_pyarrow_table(
+            columns=list(return_cols),
+            filters=dl_filters if dl_filters else None,
+        )
 
         self.shard_index_cache = table
+        self._shard_index_cache_df = None
         return True
 
-    def load_atom_array_from_shard_index_cache(
-        self,
-        specifications: Dict[str, Any],
-    ):
-        required = ["bcif_shard", "bcif_data_off", "bcif_len"]
-
+    def _get_shard_index_cache_df(self) -> pd.DataFrame:
         if self.shard_index_cache is None:
             raise ValueError("shard_index_cache is None. Call load_shard_index_cache() first.")
 
+        if self._shard_index_cache_df is None:
+            self._shard_index_cache_df = self.shard_index_cache.to_pandas()
+
+        return self._shard_index_cache_df
+
+    def load_row_from_shard_index_cache(
+        self,
+        specifications: Dict[str, Any],
+    ) -> Dict[str, Any]:
         if not isinstance(specifications, dict) or len(specifications) == 0:
             raise ValueError("specifications must be a non-empty dict of column/value filters.")
 
         cache = self.shard_index_cache
+        if cache is None:
+            raise ValueError("shard_index_cache is None. Call load_shard_index_cache() first.")
+
         missing = set(specifications.keys()) - set(cache.column_names)
         if missing:
             raise ValueError(f"Some specification columns are not in shard_index_cache: {missing}")
 
-        missing_required = set(required) - set(cache.column_names)
-        if missing_required:
-            raise ValueError(f"shard_index_cache is missing required columns: {missing_required}")
-
-        df = cache.to_pandas()
+        df = self._get_shard_index_cache_df()
         mask = pd.Series(True, index=df.index)
         for col, value in specifications.items():
             mask &= df[col] == value
@@ -153,14 +158,29 @@ class ProtLake():
                 f"Expected exactly 1 row in shard_index_cache for specifications {specifications}, found {len(matches)}."
             )
 
-        row = matches.iloc[0]
+        return matches.iloc[0].to_dict()
+
+    def load_atom_array_from_shard_index_cache(
+        self,
+        specifications: Dict[str, Any],
+        return_row: bool = False,
+    ):
+        required = ["bcif_shard", "bcif_data_off", "bcif_len"]
+        row = self.load_row_from_shard_index_cache(specifications)
+        missing_required = set(required) - set(row.keys())
+        if missing_required:
+            raise ValueError(f"shard_index_cache is missing required columns: {missing_required}")
+
         shard_path = os.path.join(self.shard_path, str(row["bcif_shard"]))
         bcif_data = read_bytes_from_shard(
             shard_path,
             int(row["bcif_data_off"]),
             int(row["bcif_len"]),
         )
-        return _bcif_bytes_to_atom_array(bcif_data)
+        if return_row:
+            return _bcif_bytes_to_atom_array(bcif_data), row
+        else:
+            return _bcif_bytes_to_atom_array(bcif_data)
 
     def validate_bcif_entries(
         self,
