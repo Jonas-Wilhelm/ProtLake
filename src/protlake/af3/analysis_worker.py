@@ -391,8 +391,8 @@ def main():
             rows = groups[gi]
             # read in design as atom array
             if args.design_dir is not None: # when using design directory, look up design file path in index
-                design_path = design_file_index.get(f"{name}.pdb", [None])
-                if design_path is None:
+                design_path = design_file_index.get(f"{name}.pdb")
+                if not design_path:
                     print(f"Warning: Design file for {name} not found in design directory, skipping")
                     continue
                 if len(design_path) > 1:
