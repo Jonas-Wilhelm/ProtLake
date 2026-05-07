@@ -243,7 +243,7 @@ class SpoolIngester:
         processed_entries = 0
         for batch_dir in batch_dirs:
             manifest = self._load_manifest(batch_dir)
-            logger.info(
+            logger.debug(
                 "Ingesting staged batch %s with %s entries",
                 manifest.get("batch_id", os.path.basename(batch_dir)),
                 manifest.get("entry_count", "unknown"),
@@ -267,10 +267,14 @@ class SpoolIngester:
 
     def run_loop(self, interval_seconds: int, run_maintenance=False) -> None:
         while True:
+            t0 = time.time()
             result = self.run_once(run_maintenance=run_maintenance)
             logger.info(
                 "Spool ingest sweep complete: %d batches, %d entries",
                 result["processed_batches"],
                 result["processed_entries"],
             )
-            time.sleep(interval_seconds)
+            elapsed = time.time() - t0
+            wait = max(0.0, interval_seconds - elapsed)
+            if wait > 0:
+                time.sleep(wait)
