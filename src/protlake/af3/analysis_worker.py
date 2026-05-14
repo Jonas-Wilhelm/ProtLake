@@ -378,6 +378,10 @@ def main():
         # time for hashing and selecting
         end_hash_time = time.time()
         print(f"Hashed and selected {sel.sum()} out of {len(sel)} groups in {end_hash_time - start_time:.3f} sec")
+
+        if len(group_names_sel) == 0:
+            print("No groups assigned to this task in this batch, skipping")
+            continue
         
         if args.design_protlake is not None:
             t0 = time.time()
