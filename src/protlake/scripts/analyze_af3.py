@@ -44,6 +44,8 @@ def main():
                         help="If set, adds --qos=interactive to SLURM jobs")
     parser.add_argument("--ncaa", type=str, nargs='+', required=False,
                         help="List of NCAA 3-letter CCD codes.")
+    parser.add_argument("--sbatch-array", type=str, required=False,
+                        help="Custom SLURM array spec (e.g. '0-99' or '1,3,5-10'). Overrides the default '0-<num-tasks-1>'")
 
     # `parse_known_args` lets us grab the rest (worker args) without erroring
     launcher_args, worker_args = parser.parse_known_args()
@@ -98,7 +100,7 @@ def main():
             f"#!/bin/bash",
             f"#SBATCH --job-name=protlake_af3_analysis_worker",
             f"#SBATCH --cpus-per-task=1",
-            f"#SBATCH --array=0-{launcher_args.num_tasks-1}",
+            f"#SBATCH --array={launcher_args.sbatch_array if launcher_args.sbatch_array else f'0-{launcher_args.num_tasks-1}'}",
             f"#SBATCH --time={launcher_args.slurm_time}",
             f"#SBATCH --mem=8G",
             f"#SBATCH --partition=cpu",
