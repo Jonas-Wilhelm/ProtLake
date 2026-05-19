@@ -1,6 +1,6 @@
 #!/usr/bin/env -S PYTHONUNBUFFERED=1 python
 
-import os, time, sys, math, random
+import os, time, sys, random
 from deltalake import DeltaTable, write_deltalake
 import pyarrow as pa
 import pyarrow.compute as pc
@@ -337,9 +337,7 @@ def main():
     dt = DeltaTable(f"file://{os.path.abspath(delta_path)}", version=snapshot_ver)
     ds = dt.to_pyarrow_dataset()
     
-    # Round array tasks to 1 significant figure
-    batch_multiplicator = int(round(num_array_tasks, -int(math.floor(math.log10(abs(num_array_tasks))))))
-    batch_size = min(2_000 * batch_multiplicator, 1_000_000)
+    batch_size = min(2_500 * num_array_tasks, 5_000_000)
     print(f"Using batch size of {batch_size} for scanning with {num_array_tasks} array tasks")
     scanner = ds.scanner(
         # columns=["name"],       # project only what you need
